@@ -32,15 +32,17 @@ export class MemoryRepositories implements Repositories {
     get: (key: string) => clone(this.threadRows.get(key)),
     save: (thread: Thread) => { this.threadRows.set(thread.key, clone(thread)) },
     list: () => [...this.threadRows.values()].map(clone),
-    active: () => this.threads.list().filter(thread => thread.pending.length > 0 || thread.evaluating !== undefined),
+    active: () => [...this.threadRows.values()].filter(thread => thread.pending.length > 0 || thread.evaluating !== undefined).map(clone),
   }
   readonly tickets = {
     get: (id: string) => clone(this.ticketRows.get(id)),
     save: (ticket: Ticket) => { this.ticketRows.set(ticket.id, clone(ticket)) },
     /** Newest first, matching the SQLite Store's order. */
     list: () => [...this.ticketRows.values()].reverse().map(clone),
-    open: () => this.tickets.list().filter(ticket => !ticket.ended),
-    active: () => this.tickets.list().filter(ticket => ticket.undelivered.length > 0 || ['pending', 'running'].includes(latestAssignment(ticket)?.state ?? '')),
+    // Filter before cloning: a long run keeps many ended tickets, and cloning them all on every pass dominates its time.
+    open: () => [...this.ticketRows.values()].reverse().filter(ticket => !ticket.ended).map(clone),
+    active: () => [...this.ticketRows.values()].reverse()
+      .filter(ticket => ticket.undelivered.length > 0 || ['pending', 'running'].includes(latestAssignment(ticket)?.state ?? '')).map(clone),
   }
   readonly decisions = {
     get: (id: string) => clone(this.decisionRows.get(id)),
