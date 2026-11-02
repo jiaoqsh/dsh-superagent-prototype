@@ -18,8 +18,8 @@ Options: `--runs N` (seeds per row, default 10), `--json`, `--out file.json` (ro
 | `model-small` | oracle vs model | Judgement on a small team hour (D1/D3/D4) |
 | `model-burst` | oracle vs model | Judgement on a short burst |
 | `model-hard` | oracle vs each model in `ROUTER_MODELS` | Hard cases: sibling tickets, stop, status, duplicate, similar new request, vague reference, question, hold, refusal, indirect request |
-| `model-saturation` | model | D2: the hard mix at rising rates (nominal 20/60/120 per minute) until cards queue and batch on their own |
-| `model-batch` | model | D2, controlled: the same mix with the Router held until `minBatch` cards wait (1/5/10/20) |
+| `model-saturation` | model | The hard mix at rising rates (nominal 20/60/120 per minute, `SAT_RATES`). Confounded at high rates: tasks repeat and short tickets end early (released inputs come back to Eval), so use `model-batch` for D2 |
+| `model-batch` | oracle and model per size | D2, controlled: a fixed hard mix (no repeated task, tickets open throughout) with the Router held until `minBatch` cards wait (1/5/10/20, `BATCH_SIZES`); judgement only, the hold inflates acknowledgement times |
 
 Model experiments read `DEEPSEEK_API_KEY` from the environment or `.env`; `ROUTER_BASE_URL` (default
 `https://api.deepseek.com`) and `ROUTER_MODEL` (default `deepseek-flash`) pick another OpenAI-compatible endpoint;

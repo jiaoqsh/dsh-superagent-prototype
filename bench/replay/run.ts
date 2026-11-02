@@ -176,6 +176,11 @@ const saturating = (perMin: number): Partial<GenerateOptions> => {
   return { durationSec: 240, requests, noise: 0, addressedNoise: Math.round(cards * 0.2), followupsPerRequest: 1, crossFraction: 1, crossAddressed: 1,
     ciPerRequest: 0, workSec: [150, 300], extraSec: [60, 120], probesPerRequest: 1, globalProbes: Math.round(cards * 0.2), taskOrder: HARD_ORDER }
 }
+/**
+ * Forced batching: the hard mix with no repeated task (12 requests over 10 minutes, tickets open throughout), so between rows
+ * only the batch size changes. Faster arrival (`saturating`) also repeats task texts and ends tickets early, which confounds it.
+ */
+const BATCHING: Partial<GenerateOptions> = { ...HARD, durationSec: 600, requests: 12, noise: 0, addressedNoise: 6, globalProbes: 10 }
 const MODELS = (process.env.ROUTER_MODELS ?? 'deepseek-flash,deepseek-v4-pro').split(',').map(name => name.trim()).filter(Boolean)
 
 const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: typeof SCHEDULING; probes?: boolean }>> = {
@@ -213,14 +218,19 @@ const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: type
   /** D2: the Router-bound rate rises until cards queue up and batch on their own (ROUTER_MODEL). */
   'model-saturation': async () => {
     const router = await model()
-    return { rows: await sequence([20, 60, 120], perMin => pooled(`${perMin}/min`, saturating(perMin), { maxWorkers: 16 }, router)),
+    return { rows: await sequence((process.env.SAT_RATES ?? '20,60,120').split(',').map(Number), perMin => pooled(`${perMin}/min`, saturating(perMin), { maxWorkers: 16 }, router)),
       columns: [...JUDGEMENT.slice(0, 1), ['arrivals/min', r => r.cardsPerMin.toFixed(0)], ...JUDGEMENT.slice(1)], probes: true }
   },
   /** D2, controlled: the same hard mix, the Router held until `minBatch` cards wait (ROUTER_MODEL). */
   'model-batch': async () => {
     const router = await model()
-    return { rows: await sequence([1, 5, 10, 20], minBatch => pooled(`minBatch=${minBatch}`, saturating(20), { maxWorkers: 16, minBatch, batchHoldSec: 90 }, router)),
-      columns: JUDGEMENT, probes: true }
+    // A long hold so batches reach their size; each size also runs the oracle, since holding alone costs some follow-ups.
+    const rows: Summary[] = []
+    for (const minBatch of (process.env.BATCH_SIZES ?? '1,5,10,20').split(',').map(Number)) {
+      const sim = { maxWorkers: 16, minBatch, batchHoldSec: 600 }
+      rows.push(await pooled(`oracle minBatch=${minBatch}`, BATCHING, sim), await pooled(`model minBatch=${minBatch}`, BATCHING, sim, router))
+    }
+    return { rows, columns: JUDGEMENT, probes: true }
   },
 }
 async function sequence<T>(items: T[], run: (item: T) => Promise<Summary>): Promise<Summary[]> {
