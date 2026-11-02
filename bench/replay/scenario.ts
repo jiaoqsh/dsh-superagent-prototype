@@ -1,3 +1,5 @@
+import { ADDRESSED_NOISE, NOISE, TASKS } from './corpus.ts'
+
 /**
  * Replay scenarios: a timed message stream with a ground-truth label per message, so a run can be scored.
  * A scenario is plain data; `generate` builds a synthetic one shaped like the article's ablation load
@@ -18,7 +20,7 @@ export type Truth =
 
 /**
  * `thread` follows the Feishu Source: a group message starts its own Thread (chat + root message) and replies join it, so
- * each top-level message in the general chat is a Thread of its own.
+ * each top-level message in the group chat is a Thread of its own (`<chat>:<root message>`).
  */
 export interface ScenarioEvent {
   /** Seconds from the start of the run. */
@@ -80,35 +82,36 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
   const events: Omit<ScenarioEvent, 'id'>[] = []
   for (let i = 0; i < o.requests; i++) {
     const task = `task-${i}`
-    const thread = `topic-${i}`
+    const thread = `oc_team:om_req${i}`
+    const text = TASKS[i % TASKS.length]!
     const at = Math.round(random() * o.durationSec)
     const workSec = between(o.workSec)
-    events.push({ at, thread, actor: pick(members), human: true, addressed: true, text: `@agent please do ${task}`, truth: { kind: 'request', task, workSec } })
+    events.push({ at, thread, actor: pick(members), human: true, addressed: true, text: text.request, truth: { kind: 'request', task, workSec } })
     for (let j = 0; j < o.followupsPerRequest; j++) {
       const later = at + Math.round(60 + random() * workSec * 1.2)
       const extraSec = between(o.extraSec)
       if (random() < o.crossFraction) {
         const addressed = random() < o.crossAddressed
-        events.push({ at: later, thread: `general/c${i}-${j}`, actor: pick(members), human: true, addressed,
-          text: `${addressed ? '@agent ' : ''}about ${task}: change of plan`, truth: { kind: 'cross', task, extraSec } })
+        events.push({ at: later, thread: `oc_team:om_cross${i}-${j}`, actor: pick(members), human: true, addressed,
+          text: `${addressed ? '@agent ' : ''}${text.cross[j % text.cross.length]!}`, truth: { kind: 'cross', task, extraSec } })
       } else {
-        events.push({ at: later, thread, actor: pick(members), human: true, addressed: false, text: `for ${task}: also handle this`,
+        events.push({ at: later, thread, actor: pick(members), human: true, addressed: false, text: text.followups[j % text.followups.length]!,
           truth: { kind: 'followup', task, extraSec } })
       }
     }
     for (let j = 0; j < o.ciPerRequest; j++) {
       const failed = random() < o.ciFailure
       events.push({ at: at + Math.round(workSec * (0.5 + random() * 0.5)), thread, actor: 'ci', human: false, addressed: false,
-        text: `CI ${failed ? 'failed' : 'passed'} for ${task}`, truth: { kind: 'ci', task, extraSec: failed ? between(o.extraSec) : 0 } })
+        text: failed ? `CI failed: 2 tests failed in ${task}` : `CI passed for ${task}`, truth: { kind: 'ci', task, extraSec: failed ? between(o.extraSec) : 0 } })
     }
   }
   for (let i = 0; i < o.noise; i++) {
-    events.push({ at: Math.round(random() * o.durationSec * 1.3), thread: `general/n${i}`, actor: pick([...members, ...guests]), human: true,
-      addressed: false, text: `chatter ${i}`, truth: { kind: 'noise' } })
+    events.push({ at: Math.round(random() * o.durationSec * 1.3), thread: `oc_team:om_noise${i}`, actor: pick([...members, ...guests]), human: true,
+      addressed: false, text: NOISE[i % NOISE.length]!, truth: { kind: 'noise' } })
   }
   for (let i = 0; i < o.addressedNoise; i++) {
-    events.push({ at: Math.round(random() * o.durationSec * 1.3), thread: `chat-${i}`, actor: pick(members), human: true, addressed: true,
-      text: `@agent thanks!`, truth: { kind: 'noise' } })
+    events.push({ at: Math.round(random() * o.durationSec * 1.3), thread: `oc_team:om_hi${i}`, actor: pick(members), human: true, addressed: true,
+      text: ADDRESSED_NOISE[i % ADDRESSED_NOISE.length]!, truth: { kind: 'noise' } })
   }
   events.sort((a, b) => a.at - b.at)
   return { name: `synthetic-seed${o.seed}`, members, events: events.map((event, index) => ({ ...event, id: `m${String(index).padStart(4, '0')}` })) }

@@ -1,25 +1,29 @@
 /**
  * Discrete-event replay of a Scenario through the real core Engine and the real settings Policy (gate), on a virtual clock.
  *
- * Modelled, not real: the main Session (Router) is one server that takes every queued card into its next step, with step
- * time `routerBaseSec + routerPerItemSec × items` (defaults fit the article's §7.2 numbers: 2.5 s at 1 item, 3.9 s at 2.8);
- * its decisions come from the scenario's ground truth, flipped with probability `routerErrorRate`. Workers take
- * `launchSec` to start, hold one of `maxWorkers` slots until their turn ends, read delivered inputs after `workerStepSec`,
- * and work for the time the scenario gives. Source polling latency is `pollSec` (0 = push).
+ * Modelled, not real: workers take `launchSec` to start, hold one of `maxWorkers` slots until their turn ends, read
+ * delivered inputs after `workerStepSec`, and work for the time the scenario gives; a Source delivers a message after a
+ * uniform share of `pollSec` (0 = push). The main Session (Router) is pluggable:
  *
- * So a run measures the system's scheduling and routing mechanics, not model judgement or code quality.
+ * - `oracleRouter` (default): one step takes every queued card; step time `routerBaseSec + routerPerItemSec × items`
+ *   (defaults fit the article's §7.2: 2.5 s at 1 item, 3.9 s at 2.8); decisions come from the scenario's ground truth,
+ *   flipped with probability `routerErrorRate`. It measures scheduling and routing mechanics, not judgement.
+ * - a model Router (`llm-router.ts`): the real orchestrator prompt and tools over a real model; each model call takes its
+ *   measured wall time in virtual time, and cards that arrive meanwhile are steered into the same turn, as in DSH.
  */
-import { Engine, MemoryRepositories, followupOwners, key, runningAssignment } from '../../src/core/index.ts'
+import { Engine, MemoryRepositories, key, reasonText, runningAssignment } from '../../src/core/index.ts'
 import type { Candidate, DomainEvent, EngineOptions, Executor, OutboundMessage, Trigger } from '../../src/core/index.ts'
-import { SettingsSchema, settingsPolicy } from '../../src/policy.ts'
+import { SettingsSchema, settingsPolicy, type Settings } from '../../src/policy.ts'
 import { rng, type Scenario, type ScenarioEvent, type Truth } from './scenario.ts'
+
+export const SOURCE = 'feishu'
 
 export interface SimOptions {
   seed: number
   maxWorkers: number
   routerBaseSec: number
   routerPerItemSec: number
-  /** Probability that the simulated Router decides a candidate wrongly (accepts noise, ignores a request, misses an attach). */
+  /** Oracle Router only: probability that it decides a candidate wrongly (accepts noise, ignores a request, misses an attach). */
   routerErrorRate: number
   launchSec: number
   workerStepSec: number
@@ -36,28 +40,120 @@ export const DEFAULT_SIM: SimOptions = {
   pollSec: 0, tickSec: 2, evalTimeoutSec: 120, mode: 'off',
 }
 
-type Job = { kind: 'candidate'; candidate: Candidate } | { kind: 'relay'; ticketId: string }
+/** What waits for the main Session: a candidate card, or a worker's ready report to relay. */
+export type Job = { kind: 'candidate'; candidate: Candidate } | { kind: 'relay'; ticketId: string; summary: string }
+
+export interface RouterStats {
+  /** Turns of the main Session; a turn runs from its first job until it stops with nothing queued. */
+  turns: number
+  /** Model steps (oracle: one per turn), and how many jobs each step took in (first step: the turn's batch; later: steered). */
+  steps: number
+  batches: number[]
+  items: number
+  busySec: number
+  refusals: string[]
+  /** Model Routers: calls, tokens, and wall-time latency per call. */
+  model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencySec: number[]; toolCalls: Record<string, number> }
+}
+/** What a Router sees of the world: the real Engine and records, virtual time, and jobs steered in while it works. */
+export interface RouterWorld {
+  readonly engine: Engine
+  readonly repo: MemoryRepositories
+  readonly settings: Settings
+  readonly stats: RouterStats
+  readonly options: SimOptions
+  /** Every Trigger received and every Decision recorded, in order, for the main Session's list resources. */
+  readonly triggers: readonly Trigger[]
+  readonly decisionIds: readonly string[]
+  now(): number
+  /** Lets `sec` of virtual time pass while the Router works; events due meanwhile run, and jobs they queue wait for `takeSteered`. */
+  advance(sec: number): void
+  /** Jobs queued since the turn started or since the last call. */
+  takeSteered(): Job[]
+  /** Records that a step took `jobs` into the Router's context; a candidate's Eval deadline starts here. */
+  delivered(jobs: Job[]): void
+  pump(): void
+  /** Runs a command the main Session issues; a refusal is recorded and returned as its message. */
+  command<T>(run: () => T): T | { refused: string }
+  /** Oracle only: the scenario's label, and the ticket of a task. */
+  truth(triggerId: string): Truth | undefined
+  ticketOf(task: string): string | undefined
+  random(): number
+}
+export interface Router { readonly name: string; turn(jobs: Job[], world: RouterWorld): Promise<void> }
+
+/** Ground-truth Router with the article's step-time model; `routerErrorRate` flips a decision. */
+export const oracleRouter: Router = {
+  name: 'oracle',
+  async turn(jobs, world) {
+    world.delivered(jobs)
+    world.advance(world.options.routerBaseSec + world.options.routerPerItemSec * jobs.length)
+    const wrong = () => world.random() < world.options.routerErrorRate
+    for (const job of jobs) {
+      if (job.kind === 'relay') { world.command(() => world.engine.reply({ purpose: 'result', ticketId: job.ticketId, text: 'Done.' })); continue }
+      const live = world.engine.candidate(job.candidate.triggers[0]!.id)
+      if (!live || live.evalId !== job.candidate.evalId) continue
+      // Attach follow-ups to their task's ticket first, as dispatch asks: cross-thread ones, and same-thread ones that came
+      // back to Eval because their ticket ended before its worker read them.
+      const followup = (id: string) => ['cross', 'followup'].includes(world.truth(id)?.kind ?? '')
+      for (const trigger of live.triggers) {
+        const label = world.truth(trigger.id)
+        if (label?.kind !== 'cross' && label?.kind !== 'followup') continue
+        const ticketId = world.ticketOf(label.task)
+        if (ticketId && !wrong()) world.command(() => world.engine.attach(ticketId, trigger.id))
+      }
+      const rest = live.triggers.filter(trigger => !followup(trigger.id))
+      if (!rest.length) continue
+      const request = rest.find(trigger => world.truth(trigger.id)?.kind === 'request')
+      const accept = wrong() ? !request : !!request
+      const head = request ?? rest[0]!
+      const label = world.truth(head.id)
+      const task = label?.kind === 'request' ? label.task : `false-${head.id}`
+      world.command(() => world.engine.decide(head.id, accept
+        ? { kind: 'accept', title: task, scope: task, reason: { code: 'explicitRouted' }, acknowledgement: 'On it.', name: 'oracle-task', evalId: live.evalId }
+        : { kind: 'ignore', reason: 'no work asked', evalId: live.evalId }))
+    }
+  },
+}
+
 interface Worker { ticketId: string; assignmentId: string; remaining: number; resumedAt: number; token: number; busy: boolean }
 interface RequestStat { triggerId: string; task: string; arrivedAt: number; ackAt?: number; resultAt?: number }
+export interface FollowupStat { triggerId: string; kind: 'followup' | 'cross'; task: string; arrivedAt: number; addressed: boolean; ackAt?: number }
+
+/** How each labelled message ended, read from the records after the run; the same for every Router. */
+export interface Score {
+  requests: { total: number; accepted: number; missed: number; reachedRouter: number }
+  /** Tickets created for no request: noise accepted, or a cross-thread follow-up accepted as new work instead of attached. */
+  falseTickets: number
+  noise: { reachedRouter: number; accepted: number }
+  cross: { total: number; reachedRouter: number; attachedRight: number; attachedWrong: number; acceptedAsNew: number; lost: number }
+  /** Same-thread follow-ups, and those that reached their task's ticket (by subscription, or in the accepted batch). */
+  followups: { total: number; fast: number }
+  /** Per message that reached the Router: what it was and what the Router did with it, for error analysis. */
+  routed: { triggerId: string; truth: Truth['kind']; outcome: string; reason?: string; text: string }[]
+}
 
 export interface SimResult {
   scenario: string
+  router: string
   options: SimOptions
   endSec: number
   requests: RequestStat[]
-  followups: { triggerId: string; kind: 'followup' | 'cross'; task: string; arrivedAt: number; path: 'fast' | 'router' | 'lost'; ackAt?: number }[]
-  router: { steps: number; items: number; batches: number[]; busySec: number; candidateItems: number; relayItems: number; refusals: string[] }
+  followups: FollowupStat[]
+  routerStats: RouterStats
   decisions: Record<string, number>
   gateRejected: number
   evals: number
   workers: { peak: number; slotWaitSec: number[] }
-  mistakes: { falseAccepts: number; missedRequests: number; missedAttaches: number }
+  score: Score
   errors: string[]
+  /** The run's records, for analysis; not serialized. */
+  repo?: MemoryRepositories
 }
 
 const BASE = Date.UTC(2026, 10, 2, 0, 0, 0)
 
-export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}): SimResult {
+export async function simulate(scenario: Scenario, options: Partial<SimOptions> = {}, router: Router = oracleRouter): Promise<SimResult> {
   const o = { ...DEFAULT_SIM, ...options }
   const random = rng(o.seed * 7919 + 17)
   let now = 0
@@ -71,21 +167,25 @@ export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}):
   }
   const iso = (sec = now) => new Date(BASE + Math.round(sec * 1000)).toISOString()
 
-  const truth = new Map<string, Truth>(scenario.events.map(event => [event.id, event.truth]))
+  const events = new Map<string, ScenarioEvent>(scenario.events.map(event => [event.id, event]))
+  const truth = (id: string) => events.get(id)?.truth
+  const stats: RouterStats = { turns: 0, steps: 0, batches: [], items: 0, busySec: 0, refusals: [] }
   const result: SimResult = {
-    scenario: scenario.name, options: o, endSec: 0, requests: [], followups: [],
-    router: { steps: 0, items: 0, batches: [], busySec: 0, candidateItems: 0, relayItems: 0, refusals: [] },
-    decisions: {}, gateRejected: 0, evals: 0, workers: { peak: 0, slotWaitSec: [] },
-    mistakes: { falseAccepts: 0, missedRequests: 0, missedAttaches: 0 }, errors: [],
+    scenario: scenario.name, router: router.name, options: o, endSec: 0, requests: [], followups: [], routerStats: stats,
+    decisions: {}, gateRejected: 0, evals: 0, workers: { peak: 0, slotWaitSec: [] }, score: undefined as unknown as Score, errors: [],
   }
   const requests = new Map<string, RequestStat>()
-  const followups = new Map<string, SimResult['followups'][number]>()
+  const followups = new Map<string, FollowupStat>()
   const taskTicket = new Map<string, string>()
   const ticketTask = new Map<string, string>()
+  /** Triggers whose card reached the Router. */
+  const routed = new Set<string>()
+  const received: Trigger[] = []
+  const decisionIds: string[] = []
 
   // --- Engine with the real settings Policy ---------------------------------------------------------------------
   const settings = SettingsSchema.parse({
-    policy: { sources: { chat: { allowed: scenario.members.map(id => ({ id })) } } },
+    policy: { sources: { [SOURCE]: { allowed: scenario.members.map(id => ({ id })) } } },
     eval: { mode: o.mode, timeoutSeconds: o.evalTimeoutSec },
     executor: { maxWorkers: o.maxWorkers },
   })
@@ -107,6 +207,7 @@ export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}):
   const jobs: Job[] = []
   const seenEvals = new Set<string>()
   let routerBusy = false
+  let turnDue = false
   const assessor: EngineOptions['assessor'] = {
     request: candidate => {
       if (seenEvals.has(candidate.evalId)) return
@@ -119,67 +220,59 @@ export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}):
       if (index >= 0) jobs.splice(index, 1)
     },
   }
-  function kickRouter() {
-    if (routerBusy || !jobs.length) return
-    const batch = jobs.splice(0)
-    routerBusy = true
-    for (const job of batch) if (job.kind === 'candidate') guard(() => engine.candidateDelivered(job.candidate.evalId))
-    const duration = o.routerBaseSec + o.routerPerItemSec * batch.length
-    result.router.steps++
-    result.router.items += batch.length
-    result.router.batches.push(batch.length)
-    result.router.busySec += duration
-    later(duration, () => {
-      for (const job of batch) {
-        if (job.kind === 'candidate') { result.router.candidateItems++; routeCandidate(job.candidate) }
-        else { result.router.relayItems++; refuse(() => engine.reply({ purpose: 'result', ticketId: job.ticketId, text: 'Done.' })) }
+  function kickRouter() { if (!routerBusy && jobs.length) turnDue = true }
+  const world: RouterWorld = {
+    get engine() { return engine }, repo, settings, stats, options: o, triggers: received, decisionIds,
+    now: () => now,
+    advance: sec => { const until = now + Math.max(0, sec); while (queue.length && queue[0]!.at <= until) step(); now = until },
+    takeSteered: () => jobs.splice(0),
+    delivered: delivered => {
+      stats.steps++
+      stats.batches.push(delivered.length)
+      stats.items += delivered.length
+      for (const job of delivered) {
+        if (job.kind !== 'candidate') continue
+        for (const trigger of job.candidate.triggers) routed.add(trigger.id)
+        guard(() => engine.candidateDelivered(job.candidate.evalId))
       }
-      routerBusy = false
-      pump()
-      kickRouter()
-    })
+    },
+    pump: () => pump(),
+    command: run => {
+      try { return run() } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        stats.refusals.push(`${now.toFixed(0)}s ${message}`)
+        return { refused: message }
+      }
+    },
+    truth, ticketOf: task => taskTicket.get(task), random,
   }
-  const wrong = () => random() < o.routerErrorRate
-  function routeCandidate(candidate: Candidate) {
-    const live = engine.candidate(candidate.triggers[0]!.id)
-    if (!live || live.evalId !== candidate.evalId) return
-    const triggers = live.triggers
-    // Attach cross-thread follow-ups to their task's ticket first, as the dispatch prompt asks.
-    for (const trigger of triggers) {
-      const label = truth.get(trigger.id)
-      if (label?.kind !== 'cross') continue
-      const ticketId = taskTicket.get(label.task)
-      if (!ticketId || wrong()) { result.mistakes.missedAttaches++; markFollowup(trigger.id, 'lost'); continue }
-      if (refuse(() => engine.attach(ticketId, trigger.id))) markFollowup(trigger.id, 'router')
-      else markFollowup(trigger.id, 'lost')
-    }
-    const rest = triggers.filter(trigger => truth.get(trigger.id)?.kind !== 'cross')
-    if (!rest.length) return
-    const request = rest.find(trigger => truth.get(trigger.id)?.kind === 'request')
-    let accept = !!request
-    if (wrong()) accept = !accept
-    const head = request ?? rest[0]!
-    if (accept) {
-      const label = truth.get(head.id)
-      const task = label?.kind === 'request' ? label.task : `false-${head.id}`
-      if (label?.kind !== 'request') result.mistakes.falseAccepts++
-      refuse(() => engine.decide(head.id, { kind: 'accept', title: task, scope: task, reason: { code: 'explicitRouted' }, acknowledgement: 'On it.',
-        name: task, evalId: live.evalId }))
-    } else {
-      if (request) result.mistakes.missedRequests++
-      refuse(() => engine.decide(head.id, { kind: 'ignore', reason: 'no work asked', evalId: live.evalId }))
-    }
+  async function runTurn() {
+    turnDue = false
+    routerBusy = true
+    stats.turns++
+    const start = now
+    const batch = jobs.splice(0)
+    try { await router.turn(batch, world) } catch (error) { result.errors.push(`${now.toFixed(0)}s router: ${String(error)}`) }
+    stats.busySec += now - start
+    routerBusy = false
+    pump()
+    kickRouter()
   }
 
   // --- Executor (workers) ---------------------------------------------------------------------------------------
   const launchQueue: { ticketId: string; assignmentId: string; queuedAt: number }[] = []
   const workers = new Map<string, Worker>()
-  const busyCount = () => [...workers.values()].filter(worker => worker.busy).length + launching
   let launching = 0
+  const busyCount = () => [...workers.values()].filter(worker => worker.busy).length + launching
   const executor: Executor = {
     start: (ticket, assignment) => later(0, () => { launchQueue.push({ ticketId: ticket.id, assignmentId: assignment.id, queuedAt: now }); kickLaunch() }),
     deliver: ticket => later(0, () => deliverInputs(ticket.id)),
     stop: ticket => later(0, () => { const worker = workers.get(ticket.id); if (worker) { worker.busy = false; worker.token++ } kickLaunch() }),
+  }
+  const workOf = (task: string | undefined) => {
+    const event = task ? requests.get(task) : undefined
+    const label = event && truth(event.triggerId)
+    return label?.kind === 'request' ? label.workSec : 300
   }
   function kickLaunch() {
     while (launchQueue.length && busyCount() < o.maxWorkers) {
@@ -189,23 +282,19 @@ export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}):
       later(o.launchSec, () => {
         launching--
         const ticket = repo.tickets.get(next.ticketId)
-        if (!ticket || ticket.ended || runningAssignment(ticket)?.id !== next.assignmentId && ticket.assignments.at(-1)?.id !== next.assignmentId) { kickLaunch(); return }
+        if (!ticket || ticket.ended || ticket.assignments.at(-1)?.id !== next.assignmentId) { kickLaunch(); return }
         if (!guard(() => engine.assignmentStarted(next.ticketId, next.assignmentId))) { kickLaunch(); return }
-        const task = ticketTask.get(next.ticketId)
         const first = ticket.assignments.length === 1
-        const work = first && task ? (requestOf(task)?.workSec ?? 300) : 0
-        const worker: Worker = { ticketId: next.ticketId, assignmentId: next.assignmentId, remaining: work, resumedAt: now,
-          token: (workers.get(next.ticketId)?.token ?? 0) + 1, busy: true }
+        // A resumed assignment's worker first reads the Inputs that woke it, so it cannot report before taking them up.
+        const worker: Worker = { ticketId: next.ticketId, assignmentId: next.assignmentId,
+          remaining: first ? workOf(ticketTask.get(next.ticketId)) : o.workerStepSec + 1,
+          resumedAt: now, token: (workers.get(next.ticketId)?.token ?? 0) + 1, busy: true }
         workers.set(next.ticketId, worker)
         result.workers.peak = Math.max(result.workers.peak, busyCount())
         schedule(worker)
         deliverInputs(next.ticketId)
       })
     }
-  }
-  const requestOf = (task: string) => {
-    for (const label of truth.values()) if (label.kind === 'request' && label.task === task) return label
-    return undefined
   }
   function schedule(worker: Worker) {
     const token = ++worker.token
@@ -216,9 +305,10 @@ export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}):
       worker.busy = false
       const ticket = repo.tickets.get(worker.ticketId)
       if (ticket && !ticket.ended) {
-        refuse(() => engine.report(worker.ticketId, { state: 'ready', summary: 'Done.' }))
+        const summary = `Done: ${ticket.title}. Changes are in a pull request, checks pass.`
+        world.command(() => engine.report(worker.ticketId, { state: 'ready', summary }))
         guard(() => engine.turnEnded(worker.ticketId, worker.assignmentId))
-        jobs.push({ kind: 'relay', ticketId: worker.ticketId })
+        jobs.push({ kind: 'relay', ticketId: worker.ticketId, summary })
         kickRouter()
       }
       kickLaunch()
@@ -237,14 +327,13 @@ export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}):
       let extra = 0
       for (const input of current.inputs) {
         if (input.kind !== 'trigger' || !inputIds.includes(input.id)) continue
-        const label = truth.get(input.triggerId)
+        const label = truth(input.triggerId)
         if (!label || label.kind === 'noise' || label.kind === 'request') continue
         extra += label.extraSec
-        if (input.human && !current.ended) {
-          if (refuse(() => engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: input.triggerId, text: 'Will do.' }))) {
-            const stat = followups.get(input.triggerId)
-            if (stat && stat.ackAt === undefined) stat.ackAt = now
-          }
+        if (input.human && !current.ended && !('refused' in (world.command(() =>
+          engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: input.triggerId, text: 'Will do.' })) as object))) {
+          const stat = followups.get(input.triggerId)
+          if (stat && stat.ackAt === undefined) stat.ackAt = now
         }
       }
       if (!extra) return
@@ -259,15 +348,16 @@ export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}):
   const emit = (event: DomainEvent) => {
     if (event.type === 'decision.recorded') {
       result.decisions[event.data.kind] = (result.decisions[event.data.kind] ?? 0) + 1
+      decisionIds.push(event.data.decisionId)
       const decision = repo.decisions.get(event.data.decisionId)
       // An ignore whose Eval never reached the Router is the gate's (program layer) refusal.
       if (decision?.kind === 'ignore' && !seenEvals.has(decision.evalId)) result.gateRejected += decision.triggerIds.length
     }
     if (event.type === 'ticket.created') {
       const decision = repo.decisions.get(event.data.decisionId)
-      const request = decision?.triggerIds.map(id => truth.get(id)).find(label => label?.kind === 'request')
+      const request = decision?.triggerIds.map(id => truth(id)).find(label => label?.kind === 'request')
       const task = request?.kind === 'request' ? request.task : `false-${event.data.ticketId}`
-      taskTicket.set(task, event.data.ticketId)
+      if (!taskTicket.has(task)) taskTicket.set(task, event.data.ticketId)
       ticketTask.set(event.data.ticketId, task)
     }
   }
@@ -283,49 +373,95 @@ export function simulate(scenario: Scenario, options: Partial<SimOptions> = {}):
   function guard(run: () => void): boolean {
     try { run(); return true } catch (error) { result.errors.push(`${now.toFixed(0)}s ${String(error)}`); return false }
   }
-  /** Runs a command a model would issue; a refusal is the answer it would get, not a simulator error. */
-  function refuse(run: () => unknown): boolean {
-    try { run(); return true } catch (error) { result.router.refusals.push(`${now.toFixed(0)}s ${error instanceof Error ? error.message : String(error)}`); return false }
-  }
-  function markFollowup(triggerId: string, path: 'fast' | 'router' | 'lost') {
-    const stat = followups.get(triggerId)
-    if (stat) stat.path = path
-  }
   function pump() { guard(() => engine.evaluateDue()) }
 
   function receive(event: ScenarioEvent) {
     const trigger: Trigger = {
-      id: event.id, source: 'chat', threads: [{ source: 'chat', id: event.thread }], actor: { source: 'chat', id: event.actor }, human: event.human,
+      id: event.id, source: SOURCE, threads: [{ source: SOURCE, id: event.thread }], actor: { source: SOURCE, id: event.actor }, human: event.human,
       at: iso(), text: event.text, ...(event.addressed ? { addressed: 'mention' as const } : {}),
-      ...(event.human ? { channel: { source: 'chat', thread: event.thread, address: { message: event.id } } } : {}), meta: {},
+      ...(event.human ? { channel: { source: SOURCE, thread: `${SOURCE}:${event.thread}`, address: { message: event.id } } } : {}), meta: {},
     }
     const label = event.truth
-    if (label.kind === 'request') requests.set(label.task, { triggerId: event.id, task: label.task, arrivedAt: event.at })
-    if (label.kind === 'followup' || label.kind === 'cross') followups.set(event.id, { triggerId: event.id, kind: label.kind, task: label.task, arrivedAt: event.at, path: 'lost' })
+    if (label.kind === 'request') requests.set(label.task, { triggerId: event.id, task: label.task, arrivedAt: now })
+    if (label.kind === 'followup' || label.kind === 'cross') {
+      followups.set(event.id, { triggerId: event.id, kind: label.kind, task: label.task, arrivedAt: now, addressed: event.addressed })
+    }
+    received.push(trigger)
     guard(() => engine.receive(trigger))
-    if (event.human && followupOwners(trigger, repo).length) markFollowup(event.id, 'fast')
     pump()
   }
 
   // --- Run ------------------------------------------------------------------------------------------------------
   for (const event of scenario.events) {
     const delay = o.pollSec ? random() * o.pollSec : 0
-    const at = event.at + delay
-    queue.push({ at, seq: seq++, run: () => receive(event) })
+    queue.push({ at: event.at + delay, seq: seq++, run: () => receive(event) })
   }
   queue.sort((a, b) => a.at - b.at || a.seq - b.seq)
   const lastArrival = Math.max(...queue.map(item => item.at))
   const tick = () => { pump(); if (now < lastArrival || queue.length) later(o.tickSec, tick) }
   later(0, tick)
-  let guardSteps = 0
-  while (queue.length && guardSteps++ < 2_000_000) {
+  function step() {
     const item = queue.shift()!
-    now = item.at
+    now = Math.max(now, item.at)
     item.run()
-    if (!queue.some(next => next.run !== tick) && now > lastArrival) break
+  }
+  let steps = 0
+  while ((queue.length || turnDue) && steps++ < 5_000_000) {
+    if (turnDue) { await runTurn(); continue }
+    step()
+    if (!turnDue && !routerBusy && !queue.some(next => next.run !== tick) && now > lastArrival) break
   }
   result.endSec = now
   result.requests = [...requests.values()]
   result.followups = [...followups.values()]
+  result.score = score(scenario, repo, routed, taskTicket)
+  Object.defineProperty(result, 'repo', { value: repo, enumerable: false })
   return result
+}
+
+/** Reads how every labelled message ended from the records, whatever Router decided it. */
+export function score(scenario: Scenario, repo: MemoryRepositories, routed: ReadonlySet<string>, taskTicket: ReadonlyMap<string, string>): Score {
+  const s: Score = {
+    requests: { total: 0, accepted: 0, missed: 0, reachedRouter: 0 }, falseTickets: 0, noise: { reachedRouter: 0, accepted: 0 },
+    cross: { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0 }, followups: { total: 0, fast: 0 }, routed: [],
+  }
+  const decisionOf = (id: string) => {
+    const decisionId = repo.triggers.disposition(id)?.decisionId
+    return decisionId ? repo.decisions.get(decisionId) : undefined
+  }
+  const requestTickets = new Set<string>()
+  for (const event of scenario.events) {
+    const disposition = repo.triggers.disposition(event.id)
+    const decision = decisionOf(event.id)
+    const fanout = disposition?.fanout ?? []
+    const label = event.truth
+    const reached = routed.has(event.id)
+    const outcome = decision?.kind === 'accept' ? `accept → ${decision.ticketId}` : fanout.length ? `reached ${fanout.join(',')}` : decision?.kind ?? 'none'
+    const reason = decision ? reasonText(decision.reason) : undefined
+    if (reached) s.routed.push({ triggerId: event.id, truth: label.kind, outcome, ...reason ? { reason } : {}, text: event.text })
+    if (label.kind === 'request') {
+      s.requests.total++
+      if (reached) s.requests.reachedRouter++
+      const ticketId = decision?.kind === 'accept' ? decision.ticketId : fanout[0]
+      if (ticketId) { s.requests.accepted++; requestTickets.add(ticketId) } else s.requests.missed++
+    } else if (label.kind === 'noise') {
+      if (reached) s.noise.reachedRouter++
+      if (decision?.kind === 'accept' && decision.triggerIds[0] === event.id) s.noise.accepted++
+    } else if (label.kind === 'cross') {
+      s.cross.total++
+      if (reached) s.cross.reachedRouter++
+      const right = taskTicket.get(label.task)
+      if (decision?.kind === 'accept' && decision.ticketId !== right) s.cross.acceptedAsNew++
+      else if (right && fanout.includes(right)) s.cross.attachedRight++
+      else if (fanout.length) s.cross.attachedWrong++
+      else s.cross.lost++
+    } else if (label.kind === 'followup') {
+      s.followups.total++
+      // It reached the ticket by subscription, or arrived before the accept and went into the ticket with its request's batch.
+      const ticketId = taskTicket.get(label.task) ?? ''
+      if (fanout.includes(ticketId) || decision?.ticketId === ticketId) s.followups.fast++
+    }
+  }
+  for (const ticket of repo.tickets.list()) if (!requestTickets.has(ticket.id)) s.falseTickets++
+  return s
 }
