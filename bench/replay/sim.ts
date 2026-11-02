@@ -14,7 +14,7 @@
 import { Engine, MemoryRepositories, key, reasonText, runningAssignment } from '../../src/core/index.ts'
 import type { Candidate, DomainEvent, EngineOptions, Executor, OutboundMessage, Trigger } from '../../src/core/index.ts'
 import { SettingsSchema, settingsPolicy, type Settings } from '../../src/policy.ts'
-import { rng, type Scenario, type ScenarioEvent, type Truth } from './scenario.ts'
+import { rng, type ProbeOutcome, type Scenario, type ScenarioEvent, type Truth } from './scenario.ts'
 
 export const SOURCE = 'feishu'
 
@@ -34,10 +34,16 @@ export interface SimOptions {
   evalTimeoutSec: number
   /** Accept mode: `off` | `observe` | `auto`. */
   mode: 'off' | 'observe' | 'auto'
+  /**
+   * Forced batching, to measure judgement against batch size: the Router starts a turn, and takes jobs steered in, only
+   * once `minBatch` jobs wait or the oldest has waited `batchHoldSec`. 1 = as DSH does (no hold).
+   */
+  minBatch: number
+  batchHoldSec: number
 }
 export const DEFAULT_SIM: SimOptions = {
   seed: 1, maxWorkers: 3, routerBaseSec: 1.72, routerPerItemSec: 0.78, routerErrorRate: 0, launchSec: 30, workerStepSec: 15,
-  pollSec: 0, tickSec: 2, evalTimeoutSec: 120, mode: 'off',
+  pollSec: 0, tickSec: 2, evalTimeoutSec: 120, mode: 'off', minBatch: 1, batchHoldSec: 60,
 }
 
 /** What waits for the main Session: a candidate card, or a worker's ready report to relay. */
@@ -104,11 +110,26 @@ export const oracleRouter: Router = {
       }
       const rest = live.triggers.filter(trigger => !followup(trigger.id))
       if (!rest.length) continue
+      const probe = world.truth(rest[0]!.id)
+      if (probe?.kind === 'probe') {
+        const ticketId = probe.task ? world.ticketOf(probe.task) : undefined
+        const want = probe.expect[0]!
+        if (want === 'attach' && ticketId) { world.command(() => world.engine.attach(ticketId, rest[0]!.id)); continue }
+        if (want === 'stop' && ticketId) {
+          world.command(() => world.engine.decide(rest[0]!.id, { kind: 'stop', ticketId, reason: { code: 'humanStop' } }))
+          continue
+        }
+        if (want !== 'accept') {
+          world.command(() => world.engine.decide(rest[0]!.id, { kind: 'ignore', reason: 'no work asked', evalId: live.evalId }))
+          continue
+        }
+      }
       const request = rest.find(trigger => world.truth(trigger.id)?.kind === 'request')
-      const accept = wrong() ? !request : !!request
+      const wanted = !!request || (probe?.kind === 'probe' && probe.expect[0] === 'accept')
+      const accept = wrong() ? !wanted : wanted
       const head = request ?? rest[0]!
       const label = world.truth(head.id)
-      const task = label?.kind === 'request' ? label.task : `false-${head.id}`
+      const task = label?.kind === 'request' ? label.task : `new-${head.id}`
       world.command(() => world.engine.decide(head.id, accept
         ? { kind: 'accept', title: task, scope: task, reason: { code: 'explicitRouted' }, acknowledgement: 'On it.', name: 'oracle-task', evalId: live.evalId }
         : { kind: 'ignore', reason: 'no work asked', evalId: live.evalId }))
@@ -129,6 +150,8 @@ export interface Score {
   cross: { total: number; reachedRouter: number; attachedRight: number; attachedWrong: number; acceptedAsNew: number; lost: number }
   /** Same-thread follow-ups, and those that reached their task's ticket (by subscription, or in the accepted batch). */
   followups: { total: number; fast: number }
+  /** Hard cases by kind: how many, how many reached the Router, how many ended as expected, and each outcome's count. */
+  probes: Record<string, { total: number; reachedRouter: number; right: number; outcomes: Record<string, number> }>
   /** Per message that reached the Router: what it was and what the Router did with it, for error analysis. */
   routed: { triggerId: string; truth: Truth['kind']; outcome: string; reason?: string; text: string }[]
 }
@@ -220,12 +243,27 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
       if (index >= 0) jobs.splice(index, 1)
     },
   }
-  function kickRouter() { if (!routerBusy && jobs.length) turnDue = true }
+  let holdUntil: number | undefined
+  /** Whether queued jobs make a batch: always without forced batching; else `minBatch` of them or the hold has run out. */
+  function batchReady(): boolean {
+    if (!jobs.length) { holdUntil = undefined; return false }
+    if (o.minBatch <= 1 || jobs.length >= o.minBatch) return true
+    if (holdUntil === undefined) {
+      const until = holdUntil = now + o.batchHoldSec
+      later(o.batchHoldSec, () => { if (holdUntil === until) kickRouter() })
+    }
+    return now >= holdUntil
+  }
+  function kickRouter() { if (!routerBusy && batchReady()) { holdUntil = undefined; turnDue = true } }
   const world: RouterWorld = {
     get engine() { return engine }, repo, settings, stats, options: o, triggers: received, decisionIds,
     now: () => now,
     advance: sec => { const until = now + Math.max(0, sec); while (queue.length && queue[0]!.at <= until) step(); now = until },
-    takeSteered: () => jobs.splice(0),
+    takeSteered: () => {
+      if (!batchReady()) return []
+      holdUntil = undefined
+      return jobs.splice(0)
+    },
     delivered: delivered => {
       stats.steps++
       stats.batches.push(delivered.length)
@@ -423,13 +461,16 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
 export function score(scenario: Scenario, repo: MemoryRepositories, routed: ReadonlySet<string>, taskTicket: ReadonlyMap<string, string>): Score {
   const s: Score = {
     requests: { total: 0, accepted: 0, missed: 0, reachedRouter: 0 }, falseTickets: 0, noise: { reachedRouter: 0, accepted: 0 },
-    cross: { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0 }, followups: { total: 0, fast: 0 }, routed: [],
+    cross: { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0 }, followups: { total: 0, fast: 0 },
+    probes: {}, routed: [],
   }
   const decisionOf = (id: string) => {
     const decisionId = repo.triggers.disposition(id)?.decisionId
     return decisionId ? repo.decisions.get(decisionId) : undefined
   }
   const requestTickets = new Set<string>()
+  /** Tickets a hard case rightly started (new work phrased indirectly, or on a similar subject); not false. */
+  const probeTickets = new Set<string>()
   for (const event of scenario.events) {
     const disposition = repo.triggers.disposition(event.id)
     const decision = decisionOf(event.id)
@@ -455,6 +496,23 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
       else if (right && fanout.includes(right)) s.cross.attachedRight++
       else if (fanout.length) s.cross.attachedWrong++
       else s.cross.lost++
+    } else if (label.kind === 'probe') {
+      const tally = s.probes[label.probe] ??= { total: 0, reachedRouter: 0, right: 0, outcomes: {} }
+      tally.total++
+      if (reached) tally.reachedRouter++
+      const right = label.task ? taskTicket.get(label.task) : undefined
+      let ended: ProbeOutcome | 'attach-wrong' | 'stop-wrong' | 'expired'
+      if (decision?.kind === 'stop') ended = decision.ticketId === right ? 'stop' : 'stop-wrong'
+      else if (decision?.kind === 'accept' && decision.ticketId !== right) ended = 'accept'
+      else if (right && fanout.includes(right)) ended = 'attach'
+      else if (fanout.length) ended = 'attach-wrong'
+      else if (decision?.kind === 'unavailable' || !decision) ended = 'expired'
+      else ended = 'ignore'
+      tally.outcomes[ended] = (tally.outcomes[ended] ?? 0) + 1
+      if ((label.expect as string[]).includes(ended)) {
+        tally.right++
+        if (ended === 'accept' && decision?.ticketId) probeTickets.add(decision.ticketId)
+      }
     } else if (label.kind === 'followup') {
       s.followups.total++
       // It reached the ticket by subscription, or arrived before the accept and went into the ticket with its request's batch.
@@ -462,6 +520,6 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
       if (fanout.includes(ticketId) || decision?.ticketId === ticketId) s.followups.fast++
     }
   }
-  for (const ticket of repo.tickets.list()) if (!requestTickets.has(ticket.id)) s.falseTickets++
+  for (const ticket of repo.tickets.list()) if (!requestTickets.has(ticket.id) && !probeTickets.has(ticket.id)) s.falseTickets++
   return s
 }

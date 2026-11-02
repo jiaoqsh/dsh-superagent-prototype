@@ -1,4 +1,4 @@
-import { ADDRESSED_NOISE, NOISE, TASKS } from './corpus.ts'
+import { ADDRESSED_NOISE, GLOBAL_PROBES, NOISE, TASKS, type GlobalProbe, type TaskProbe } from './corpus.ts'
 
 /**
  * Replay scenarios: a timed message stream with a ground-truth label per message, so a run can be scored.
@@ -17,6 +17,21 @@ export type Truth =
   | { kind: 'cross'; task: string; extraSec: number }
   /** A CI result on the task's thread; `extraSec` > 0 is a failure the worker must fix. */
   | { kind: 'ci'; task: string; extraSec: number }
+  /** A hard case (`corpus.ts`): `expect` lists the outcomes a correct Router may reach; `task` is the task it is about, if any. */
+  | { kind: 'probe'; probe: TaskProbe | GlobalProbe; task?: string; expect: ProbeOutcome[]; extraSec: number }
+
+/** How a message ended: a new ticket, attached to its task's ticket, its task's ticket stopped, or no ticket at all. */
+export type ProbeOutcome = 'accept' | 'attach' | 'stop' | 'ignore'
+export const PROBE_EXPECT: Record<TaskProbe | GlobalProbe, ProbeOutcome[]> = {
+  stop: ['stop'],
+  // Answering is enough; attaching wakes the worker to answer, also right.
+  status: ['ignore', 'attach'],
+  // The same work again: anything but a second ticket. dispatch.md forbids attaching a message that is not explicit, so
+  // the product's own answer is ignore.
+  duplicate: ['ignore', 'attach'],
+  similarNew: ['accept'],
+  vague: ['ignore'], question: ['ignore'], hold: ['ignore'], decline: ['ignore'], polite: ['accept'],
+}
 
 /**
  * `thread` follows the Feishu Source: a group message starts its own Thread (chat + root message) and replies join it, so
@@ -54,11 +69,20 @@ export interface GenerateOptions {
   ciFailure: number
   workSec: [number, number]
   extraSec: [number, number]
+  /** Hard cases per request, about its task (`TaskProbe`, in rotation), each while the task is open. */
+  probesPerRequest: number
+  /** Hard cases about no task (`GlobalProbe`, in rotation), after the first fifth of the window. */
+  globalProbes: number
+  /** Indices into `TASKS` in the order requests use them; default in order. */
+  taskOrder?: number[]
 }
 export const DEFAULT_GENERATE: GenerateOptions = {
   seed: 1, durationSec: 3600, requests: 20, noise: 220, addressedNoise: 10, followupsPerRequest: 2,
   crossFraction: 0.25, crossAddressed: 0.5, ciPerRequest: 1, ciFailure: 0.3, workSec: [600, 1800], extraSec: [120, 600],
+  probesPerRequest: 0, globalProbes: 0,
 }
+
+const TASK_PROBES: TaskProbe[] = ['similarNew', 'duplicate', 'status', 'stop']
 
 /** Small deterministic PRNG (mulberry32) so a seed reproduces a scenario exactly. */
 export function rng(seed: number): () => number {
@@ -83,12 +107,24 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
   for (let i = 0; i < o.requests; i++) {
     const task = `task-${i}`
     const thread = `oc_team:om_req${i}`
-    const text = TASKS[i % TASKS.length]!
+    const order = o.taskOrder ?? TASKS.map((_, index) => index)
+    const text = TASKS[order[i % order.length]!]!
     const at = Math.round(random() * o.durationSec)
     const workSec = between(o.workSec)
-    events.push({ at, thread, actor: pick(members), human: true, addressed: true, text: text.request, truth: { kind: 'request', task, workSec } })
+    const actor = pick(members)
+    events.push({ at, thread, actor, human: true, addressed: true, text: text.request, truth: { kind: 'request', task, workSec } })
+    const kinds = Array.from({ length: o.probesPerRequest }, (_, j) => TASK_PROBES[(i + j) % TASK_PROBES.length]!)
+    // A stop comes last, so the task's other messages find it open.
+    const stopAt = kinds.includes('stop') ? at + Math.round(workSec * 0.9) : Infinity
+    for (const probe of kinds) {
+      const when = probe === 'stop' ? stopAt : at + Math.round(90 + random() * workSec * 0.6)
+      // A duplicate usually comes from someone who missed the first request.
+      const by = probe === 'duplicate' ? pick(members.filter(member => member !== actor)) : pick(members)
+      events.push({ at: when, thread: `oc_team:om_probe${i}-${probe}`, actor: by, human: true, addressed: true, text: text.probes[probe],
+        truth: { kind: 'probe', probe, task, expect: PROBE_EXPECT[probe], extraSec: between(o.extraSec) } })
+    }
     for (let j = 0; j < o.followupsPerRequest; j++) {
-      const later = at + Math.round(60 + random() * workSec * 1.2)
+      const later = Math.min(stopAt - 60, at + Math.round(60 + random() * workSec * 1.2))
       const extraSec = between(o.extraSec)
       if (random() < o.crossFraction) {
         const addressed = random() < o.crossAddressed
@@ -112,6 +148,14 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
   for (let i = 0; i < o.addressedNoise; i++) {
     events.push({ at: Math.round(random() * o.durationSec * 1.3), thread: `oc_team:om_hi${i}`, actor: pick(members), human: true, addressed: true,
       text: ADDRESSED_NOISE[i % ADDRESSED_NOISE.length]!, truth: { kind: 'noise' } })
+  }
+  const globals = Object.keys(GLOBAL_PROBES) as GlobalProbe[]
+  for (let i = 0; i < o.globalProbes; i++) {
+    const probe = globals[i % globals.length]!
+    const texts = GLOBAL_PROBES[probe]
+    events.push({ at: Math.round(o.durationSec * (0.2 + random() * 0.8)), thread: `oc_team:om_g${i}`, actor: pick(members), human: true,
+      addressed: true, text: texts[Math.floor(i / globals.length) % texts.length]!,
+      truth: { kind: 'probe', probe, expect: PROBE_EXPECT[probe], extraSec: between(o.extraSec) } })
   }
   events.sort((a, b) => a.at - b.at)
   return { name: `synthetic-seed${o.seed}`, members, events: events.map((event, index) => ({ ...event, id: `m${String(index).padStart(4, '0')}` })) }

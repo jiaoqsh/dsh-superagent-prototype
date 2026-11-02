@@ -4,10 +4,13 @@
  *   node --experimental-transform-types --no-warnings bench/replay/run.ts <experiment> [--json] [--runs N] [--out file.json]
  *
  * Oracle experiments (deterministic, free): baseline, sweep-rate, sweep-router, sweep-workers, sweep-errors, sweep-poll, sweep-cross.
- * Model experiments (call the API in DEEPSEEK_API_KEY, model ROUTER_MODEL or deepseek-flash): model-small, model-burst.
+ * Model experiments (call the API in DEEPSEEK_API_KEY, model ROUTER_MODEL or deepseek-flash): model-small, model-burst,
+ * model-hard (oracle and every model in ROUTER_MODELS, default deepseek-flash,deepseek-v4-pro), model-saturation, model-batch.
+ * Model runs of one row run their seeds concurrently.
  */
 import { writeFile } from 'node:fs/promises'
-import { generate, type GenerateOptions } from './scenario.ts'
+import { HARD_ORDER } from './corpus.ts'
+import { PROBE_EXPECT, generate, type GenerateOptions } from './scenario.ts'
 import { simulate, oracleRouter, type Router, type SimOptions, type SimResult } from './sim.ts'
 import { loadEnv, modelRouter } from './llm-router.ts'
 
@@ -32,10 +35,14 @@ export interface Summary {
   routerTurns: number; routerSteps: number; meanBatch: number; maxBatch: number; routerBusy: number; perItemSec: number
   evals: number; gateRejected: number; unavailable: number; refusals: number
   peakWorkers: number; slotWaitP95: number
+  /** Hard cases by kind, pooled over runs. */
+  probes: Record<string, { total: number; reachedRouter: number; right: number; outcomes: Record<string, number> }>
+  /** Addressed messages per minute within the generation window: the peak rate offered to the Router. */
+  cardsPerMin: number
   model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencyP50: number; latencyP95: number; toolCalls: Record<string, number> }
   errors: string[]
 }
-export function summarize(label: string, results: SimResult[]): Summary {
+export function summarize(label: string, results: (SimResult & { window?: number; arrivals?: number })[]): Summary {
   const requests = results.flatMap(r => r.requests)
   const acks = requests.flatMap(r => r.ackAt !== undefined ? [r.ackAt - r.arrivedAt] : [])
   const done = requests.flatMap(r => r.resultAt !== undefined ? [r.resultAt - r.arrivedAt] : [])
@@ -43,8 +50,15 @@ export function summarize(label: string, results: SimResult[]): Summary {
   const models = stats.flatMap(st => st.model ? [st.model] : [])
   const cross = { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0 }
   for (const r of results) for (const k of Object.keys(cross) as (keyof typeof cross)[]) cross[k] += r.score.cross[k]
+  const probes: Summary['probes'] = {}
+  for (const r of results) for (const [kind, tally] of Object.entries(r.score.probes)) {
+    const into = probes[kind] ??= { total: 0, reachedRouter: 0, right: 0, outcomes: {} }
+    into.total += tally.total; into.reachedRouter += tally.reachedRouter; into.right += tally.right
+    for (const [outcome, n] of Object.entries(tally.outcomes)) into.outcomes[outcome] = (into.outcomes[outcome] ?? 0) + n
+  }
   return {
-    label, runs: results.length,
+    label, runs: results.length, probes,
+    cardsPerMin: sum(results, r => r.arrivals ?? 0) / Math.max(1, sum(results, r => r.window ?? 1)),
     requests: requests.length, accepted: sum(results, r => r.score.requests.accepted), completed: done.length,
     ackP50: quantile(acks, 0.5), ackP95: quantile(acks, 0.95), resultP50: quantile(done, 0.5), resultP95: quantile(done, 0.95),
     followFast: sum(results, r => r.score.followups.fast), followTotal: sum(results, r => r.score.followups.total), cross,
@@ -74,8 +88,18 @@ const all: SimResult[] = []
 
 async function pooled(label: string, gen: Partial<GenerateOptions>, sim: Partial<SimOptions>, router: () => Router = () => oracleRouter,
   runs = RUNS): Promise<Summary> {
-  const results: SimResult[] = []
-  for (let i = 0; i < runs; i++) results.push(await simulate(generate({ ...gen, seed: i + 1 }), { ...sim, seed: i + 1 }, router()))
+  const one = (i: number) => {
+    const scenario = generate({ ...gen, seed: i + 1 })
+    // Addressed messages per minute within the generation window (follow-ups trail after it).
+    const window = (gen.durationSec ?? 3600) / 60
+    const arrivals = scenario.events.filter(e => e.addressed && e.at < window * 60).length
+    return simulate(scenario, { ...sim, seed: i + 1 }, router()).then(result => Object.assign(result, { window, arrivals }))
+  }
+  const seeds = Array.from({ length: runs }, (_, i) => i)
+  // Model runs wait on the network, so their seeds run together; oracle runs are CPU-bound and run in turn.
+  const results: (SimResult & { window: number; arrivals: number })[] = router().name === 'oracle'
+    ? await seeds.reduce<Promise<(SimResult & { window: number; arrivals: number })[]>>(async (done, i) => [...await done, await one(i)], Promise.resolve([]))
+    : await Promise.all(seeds.map(one))
   all.push(...results)
   const summary = summarize(label, results)
   if (summary.errors.length) console.error(`[${label}] ${summary.errors.length} simulator errors, first: ${summary.errors.slice(0, 3).join(' | ')}`)
@@ -121,12 +145,11 @@ const JUDGEMENT: [string, (row: Summary) => string][] = [
   ['tokens in(cached)/out', r => r.model ? `${(r.model.promptTokens / 1000).toFixed(0)}k(${(r.model.cachedTokens / 1000).toFixed(0)}k)/${(r.model.completionTokens / 1000).toFixed(1)}k` : '—'],
 ]
 
-async function model(): Promise<() => Router> {
+async function model(name = process.env.ROUTER_MODEL ?? 'deepseek-flash'): Promise<() => Router> {
   await loadEnv()
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error('DEEPSEEK_API_KEY is not set (put it in .env)')
   const baseUrl = process.env.ROUTER_BASE_URL ?? 'https://api.deepseek.com'
-  const name = process.env.ROUTER_MODEL ?? 'deepseek-flash'
   const verbose = args.includes('--verbose')
   return () => modelRouter({ baseUrl, apiKey, model: name, ...verbose ? { onStep: step => console.error(
     `  ${step.atSec.toFixed(0).padStart(5)}s  ${step.latencySec.toFixed(1).padStart(5)}s  +${step.jobs} job(s)  ${step.toolCalls.join(',') || '(text)'}${step.text ? `  “${step.text.replace(/\s+/g, ' ').slice(0, 80)}”` : ''}`) } : {} })
@@ -138,7 +161,24 @@ const SMALL: Partial<GenerateOptions> = { durationSec: 1800, requests: 8, noise:
 const BURST: Partial<GenerateOptions> = { durationSec: 180, requests: 12, noise: 20, addressedNoise: 12, followupsPerRequest: 1, crossFraction: 1,
   crossAddressed: 1, ciPerRequest: 0, workSec: [300, 600], extraSec: [60, 120] }
 
-const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: typeof SCHEDULING }>> = {
+/**
+ * Hard cases (`corpus.ts`): eight tasks over 30 minutes, siblings first, so two tickets on the same page or feature are open
+ * together; per task one cross-thread follow-up and two hard cases (stop, status, duplicate, similar new request, in
+ * rotation), and ten hard cases about no task (vague reference, question, request on hold, refusal, indirect request).
+ */
+const HARD: Partial<GenerateOptions> = { durationSec: 1800, requests: 8, noise: 30, addressedNoise: 4, followupsPerRequest: 2, crossFraction: 0.5,
+  crossAddressed: 1, ciPerRequest: 0, workSec: [900, 1500], extraSec: [60, 180], probesPerRequest: 2, globalProbes: 10, taskOrder: HARD_ORDER }
+/** Saturation: the hard mix at nominally `perMin` cards per minute to the Router over 4 minutes, follow-ups trailing after it (requests, their cross-thread follow-ups and hard cases, small talk). */
+const saturating = (perMin: number): Partial<GenerateOptions> => {
+  const cards = perMin * 4
+  // Per request: the request, a cross-thread follow-up and a hard case; the rest is hard cases about no task and small talk.
+  const requests = Math.max(2, Math.round(cards * 0.2))
+  return { durationSec: 240, requests, noise: 0, addressedNoise: Math.round(cards * 0.2), followupsPerRequest: 1, crossFraction: 1, crossAddressed: 1,
+    ciPerRequest: 0, workSec: [150, 300], extraSec: [60, 120], probesPerRequest: 1, globalProbes: Math.round(cards * 0.2), taskOrder: HARD_ORDER }
+}
+const MODELS = (process.env.ROUTER_MODELS ?? 'deepseek-flash,deepseek-v4-pro').split(',').map(name => name.trim()).filter(Boolean)
+
+const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: typeof SCHEDULING; probes?: boolean }>> = {
   baseline: async () => ({ rows: [await pooled('baseline', {}, {})], columns: SCHEDULING }),
   'sweep-rate': async () => ({ rows: await sequence([3600, 1200, 600, 300, 120], duration =>
     pooled(`window ${duration / 60}m`, { durationSec: duration, workSec: [60, 180], extraSec: [30, 90] }, {})), columns: SCHEDULING }),
@@ -164,6 +204,24 @@ const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: type
     const router = await model()
     return { rows: [await pooled('oracle', BURST, { maxWorkers: 16 }), await pooled(`model`, BURST, { maxWorkers: 16 }, router)], columns: JUDGEMENT }
   },
+  /** Hard cases: oracle against each model in ROUTER_MODELS. */
+  'model-hard': async () => {
+    const rows = [await pooled('oracle', HARD, { maxWorkers: 16 })]
+    for (const name of MODELS) rows.push(await pooled(name, HARD, { maxWorkers: 16 }, await model(name)))
+    return { rows, columns: JUDGEMENT, probes: true }
+  },
+  /** D2: the Router-bound rate rises until cards queue up and batch on their own (ROUTER_MODEL). */
+  'model-saturation': async () => {
+    const router = await model()
+    return { rows: await sequence([20, 60, 120], perMin => pooled(`${perMin}/min`, saturating(perMin), { maxWorkers: 16 }, router)),
+      columns: [...JUDGEMENT.slice(0, 1), ['arrivals/min', r => r.cardsPerMin.toFixed(0)], ...JUDGEMENT.slice(1)], probes: true }
+  },
+  /** D2, controlled: the same hard mix, the Router held until `minBatch` cards wait (ROUTER_MODEL). */
+  'model-batch': async () => {
+    const router = await model()
+    return { rows: await sequence([1, 5, 10, 20], minBatch => pooled(`minBatch=${minBatch}`, saturating(20), { maxWorkers: 16, minBatch, batchHoldSec: 90 }, router)),
+      columns: JUDGEMENT, probes: true }
+  },
 }
 async function sequence<T>(items: T[], run: (item: T) => Promise<Summary>): Promise<Summary[]> {
   const rows: Summary[] = []
@@ -174,8 +232,22 @@ async function sequence<T>(items: T[], run: (item: T) => Promise<Summary>): Prom
 const name = args.find(arg => !arg.startsWith('--') && args[args.indexOf(arg) - 1] !== '--runs' && args[args.indexOf(arg) - 1] !== '--out') ?? 'baseline'
 const experiment = experiments[name]
 if (!experiment) { console.error(`Unknown experiment ${name}; one of ${Object.keys(experiments).join(', ')}`); process.exit(1) }
-const { rows, columns } = await experiment()
+const { rows, columns, probes } = await experiment()
 if (args.includes('--json')) console.log(JSON.stringify(rows, null, 2))
-else { console.log(`# ${name} (${RUNS} seed${RUNS === 1 ? '' : 's'} per row)\n`); table(rows, columns) }
+else {
+  console.log(`# ${name} (${RUNS} seed${RUNS === 1 ? '' : 's'} per row)\n`)
+  table(rows, columns)
+  if (probes) {
+    console.log('\n## Hard cases: right/total (outcomes)\n')
+    const kinds = [...new Set(rows.flatMap(row => Object.keys(row.probes)))]
+    const all = (row: Summary) => Object.values(row.probes).reduce((a, t) => [a[0]! + t.right, a[1]! + t.total], [0, 0])
+    table(rows, [['case', r => r.label], ['all', r => `${all(r)[0]}/${all(r)[1]}`], ...kinds.map(kind => [kind, (r: Summary) => {
+      const t = r.probes[kind]
+      if (!t) return '—'
+      const wrong = Object.entries(t.outcomes).filter(([outcome]) => !PROBE_EXPECT[kind as keyof typeof PROBE_EXPECT].includes(outcome as never))
+      return `${t.right}/${t.total}${wrong.length ? ` (${wrong.map(([o, n]) => `${o}:${n}`).join(' ')})` : ''}`
+    }] as [string, (row: Summary) => string])])
+  }
+}
 const out = flag('--out')
 if (out) await writeFile(out, JSON.stringify({ rows, results: all.map(r => ({ ...r, requests: r.requests, score: r.score })) }, null, 2))
