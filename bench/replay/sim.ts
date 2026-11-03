@@ -45,11 +45,21 @@ export interface SimOptions {
    * does), so it may stop the work on it. Off by default, as in the runs before it was modelled.
    */
   followupNotices: boolean
+  /**
+   * Fault injection (#8): the share of first assignments whose worker hangs at a random point of its work, holding its slot
+   * without reporting or reading input (a stuck tool or model call; the prototype has no timer for a running turn).
+   */
+  hangRate: number
+  /**
+   * A Watchdog that notices a worker with no activity for this many seconds, ends its turn as failed (the person is told and
+   * may retry) and frees its slot; 0 is none, as in the prototype.
+   */
+  watchdogSec: number
 }
 export const DEFAULT_SIM: SimOptions = {
   seed: 1, maxWorkers: 3, routerBaseSec: 1.72, routerPerItemSec: 0.78, routerErrorRate: 0, launchSec: 30, workerStepSec: 15,
   pollSec: 0, tickSec: 2, evalTimeoutSec: 120, mode: 'off', minBatch: 1, batchHoldSec: 60,
-  followupNotices: false,
+  followupNotices: false, hangRate: 0, watchdogSec: 0,
 }
 
 /** What waits for the main Session: a candidate card, or a worker's ready report to relay. */
@@ -154,7 +164,7 @@ export const oracleRouter: Router = {
   },
 }
 
-interface Worker { ticketId: string; assignmentId: string; remaining: number; resumedAt: number; token: number; busy: boolean }
+interface Worker { ticketId: string; assignmentId: string; remaining: number; resumedAt: number; token: number; busy: boolean; hungAt?: number }
 interface RequestStat { triggerId: string; task: string; arrivedAt: number; ackAt?: number; resultAt?: number }
 export interface FollowupStat { triggerId: string; kind: 'followup' | 'cross'; task: string; arrivedAt: number; addressed: boolean; ackAt?: number }
 
@@ -201,6 +211,11 @@ export interface SimResult {
   gateRejected: number
   evals: number
   workers: { peak: number; slotWaitSec: number[] }
+  /**
+   * Injected hangs: how many, after how long the Watchdog noticed each, how many nobody noticed by the end, the slot-seconds
+   * they held (unnoticed ones until the run ended, so a floor), and tickets still waiting for a slot when the run ended.
+   */
+  faults: { hung: number; detectedSec: number[]; unnoticed: number; slotSec: number; neverStarted: number }
   score: Score
   errors: string[]
   /** The run's records, for analysis; not serialized. */
@@ -228,7 +243,7 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   const stats: RouterStats = { turns: 0, steps: 0, batches: [], items: 0, busySec: 0, refusals: [] }
   const result: SimResult = {
     scenario: scenario.name, router: router.name, options: o, endSec: 0, requests: [], followups: [], routerStats: stats,
-    decisions: {}, gateRejected: 0, evals: 0, workers: { peak: 0, slotWaitSec: [] }, score: undefined as unknown as Score, errors: [],
+    decisions: {}, gateRejected: 0, evals: 0, workers: { peak: 0, slotWaitSec: [] }, faults: { hung: 0, detectedSec: [], unnoticed: 0, slotSec: 0, neverStarted: 0 }, score: undefined as unknown as Score, errors: [],
   }
   const requests = new Map<string, RequestStat>()
   const followups = new Map<string, FollowupStat>()
@@ -347,7 +362,12 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   let launching = 0
   const busyCount = () => [...workers.values()].filter(worker => worker.busy).length + launching
   const executor: Executor = {
-    start: (ticket, assignment) => later(0, () => { launchQueue.push({ ticketId: ticket.id, assignmentId: assignment.id, queuedAt: now }); kickLaunch() }),
+    // The Engine asks again for an assignment that waits for a slot; one launch per assignment, as the DSH executor keys it.
+    start: (ticket, assignment) => later(0, () => {
+      if (launchQueue.some(item => item.assignmentId === assignment.id) || workers.get(ticket.id)?.assignmentId === assignment.id) return
+      launchQueue.push({ ticketId: ticket.id, assignmentId: assignment.id, queuedAt: now })
+      kickLaunch()
+    }),
     deliver: ticket => later(0, () => deliverInputs(ticket.id)),
     stop: ticket => later(0, () => { const worker = workers.get(ticket.id); if (worker) { worker.busy = false; worker.token++ } kickLaunch() }),
   }
@@ -371,12 +391,40 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
         const worker: Worker = { ticketId: next.ticketId, assignmentId: next.assignmentId,
           remaining: first ? workOf(ticketTask.get(next.ticketId)) : o.workerStepSec + 1,
           resumedAt: now, token: (workers.get(next.ticketId)?.token ?? 0) + 1, busy: true }
+        if (workers.get(next.ticketId)?.assignmentId === next.assignmentId) result.errors.push(`${now.toFixed(0)}s assignment ${next.assignmentId} launched twice`)
         workers.set(next.ticketId, worker)
         result.workers.peak = Math.max(result.workers.peak, busyCount())
         schedule(worker)
         deliverInputs(next.ticketId)
+        if (first && o.hangRate > 0 && faultRandom() < o.hangRate) hang(worker, faultRandom() * worker.remaining)
       })
     }
+  }
+  /** Separate draws, so injecting faults leaves the rest of a run as it was. */
+  const faultRandom = rng(o.seed * 7919 + 17)
+  /** The worker stops after `afterSec`: it keeps its slot and neither reports nor reads; a Watchdog may notice it. */
+  function hang(worker: Worker, afterSec: number) {
+    later(afterSec, () => {
+      if (!worker.busy || worker.hungAt !== undefined) return
+      worker.hungAt = now
+      worker.token++
+      result.faults.hung++
+      const since = now
+      if (!o.watchdogSec) return
+      later(o.watchdogSec, () => {
+        if (worker.hungAt === undefined || !worker.busy) return
+        worker.busy = false
+        result.faults.detectedSec.push(now - since)
+        result.faults.slotSec += now - since
+        const ticket = repo.tickets.get(worker.ticketId)
+        if (ticket && !ticket.ended) {
+          const summary = `Watchdog: no activity for ${Math.round(o.watchdogSec / 60)} min; the turn was stopped.`
+          world.command(() => engine.report(worker.ticketId, { state: 'failed', summary }))
+          guard(() => engine.turnEnded(worker.ticketId, worker.assignmentId))
+        }
+        kickLaunch()
+      })
+    })
   }
   function schedule(worker: Worker) {
     const token = ++worker.token
@@ -400,10 +448,12 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
     const ticket = repo.tickets.get(ticketId)
     const worker = workers.get(ticketId)
     const assignment = ticket && runningAssignment(ticket)
-    if (!ticket || !worker || !assignment || assignment.id !== worker.assignmentId || !ticket.undelivered.length) return
+    if (!ticket || !worker || worker.hungAt !== undefined || !assignment || assignment.id !== worker.assignmentId || !ticket.undelivered.length) return
     const inputIds = [...ticket.undelivered]
     if (!guard(() => engine.inputsDelivered(ticketId, assignment.id, inputIds))) return
     later(o.workerStepSec, () => {
+      // A worker that hung meanwhile reads nothing more.
+      if (worker.hungAt !== undefined) return
       guard(() => engine.inputsRead(ticketId, inputIds))
       const current = repo.tickets.get(ticketId)!
       let extra = 0
@@ -511,6 +561,8 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
     if (!turnDue && !routerBusy && !queue.some(next => next.run !== tick) && now > lastArrival) break
   }
   result.endSec = now
+  for (const worker of workers.values()) if (worker.hungAt !== undefined && worker.busy) { result.faults.unnoticed++; result.faults.slotSec += now - worker.hungAt }
+  result.faults.neverStarted = launchQueue.length
   result.requests = [...requests.values()]
   result.followups = [...followups.values()]
   result.score = score(scenario, repo, routed, taskTicket, released, releasedRouted)

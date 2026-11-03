@@ -33,6 +33,22 @@ describe('replay simulator', () => {
     const silent = await simulate(scripted, { seed: 2, maxWorkers: 16 })
     expect(silent.score.probes.threadStop!.right).toBe(0)
   })
+  it('launches an assignment once however often the Engine asks for it', async () => {
+    // The Engine asks again for an assignment that waits for a slot; a second launch would restart its work.
+    for (const seed of [1, 2, 3]) expect((await simulate(generate({ seed }), { seed })).errors).toEqual([])
+  })
+  it('lets an injected hang hold its slot until a Watchdog notices it', async () => {
+    const scenario = generate({ seed: 4 })
+    const hung = await simulate(scenario, { seed: 4, hangRate: 0.3 })
+    expect(hung.faults.hung).toBeGreaterThan(0)
+    expect(hung.faults.unnoticed).toBe(hung.faults.hung)
+    expect(hung.faults.detectedSec).toEqual([])
+    const watched = await simulate(scenario, { seed: 4, hangRate: 0.3, watchdogSec: 1200 })
+    expect(watched.faults.unnoticed).toBe(0)
+    expect(watched.faults.detectedSec.length).toBe(watched.faults.hung)
+    expect(new Set(watched.faults.detectedSec)).toEqual(new Set([1200]))
+    expect(watched.faults.neverStarted).toBe(0)
+  })
   it('is deterministic for a seed', async () => {
     const run = () => simulate(generate({ seed: 5, requests: 3, noise: 10 }), { seed: 5, pollSec: 30 })
     expect((await run()).requests).toEqual((await run()).requests)
