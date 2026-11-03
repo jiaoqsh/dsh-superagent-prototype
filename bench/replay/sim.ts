@@ -11,7 +11,7 @@
  * - a model Router (`llm-router.ts`): the real orchestrator prompt and tools over a real model; each model call takes its
  *   measured wall time in virtual time, and cards that arrive meanwhile are steered into the same turn, as in DSH.
  */
-import { Engine, MemoryRepositories, key, reasonText, runningAssignment } from '../../src/core/index.ts'
+import { Engine, MemoryRepositories, followupOwners, key, liveTicket, reasonText, runningAssignment } from '../../src/core/index.ts'
 import type { Candidate, DomainEvent, EngineOptions, Executor, OutboundMessage, Trigger } from '../../src/core/index.ts'
 import { SettingsSchema, settingsPolicy, type Settings } from '../../src/policy.ts'
 import { rng, type ProbeOutcome, type Scenario, type ScenarioEvent, type Truth } from './scenario.ts'
@@ -40,14 +40,22 @@ export interface SimOptions {
    */
   minBatch: number
   batchHoldSec: number
+  /**
+   * Tell the Router of a person's message that reached a live ticket by its thread (a `follow_up` notice, as the runtime
+   * does), so it may stop the work on it. Off by default, as in the runs before it was modelled.
+   */
+  followupNotices: boolean
 }
 export const DEFAULT_SIM: SimOptions = {
   seed: 1, maxWorkers: 3, routerBaseSec: 1.72, routerPerItemSec: 0.78, routerErrorRate: 0, launchSec: 30, workerStepSec: 15,
   pollSec: 0, tickSec: 2, evalTimeoutSec: 120, mode: 'off', minBatch: 1, batchHoldSec: 60,
+  followupNotices: false,
 }
 
 /** What waits for the main Session: a candidate card, or a worker's ready report to relay. */
 export type Job = { kind: 'candidate'; candidate: Candidate } | { kind: 'relay'; ticketId: string; summary: string }
+  /** A person's message that reached a live ticket by its thread (`followupNotices`). */
+  | { kind: 'followup'; triggerId: string }
 
 export interface RouterStats {
   /** Turns of the main Session; a turn runs from its first job until it stops with nothing queued. */
@@ -59,7 +67,7 @@ export interface RouterStats {
   busySec: number
   refusals: string[]
   /** Model Routers: calls, tokens, and wall-time latency per call. */
-  model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencySec: number[]; toolCalls: Record<string, number> }
+  model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencySec: number[]; toolCalls: Record<string, number>; retries?: number }
 }
 /** What a Router sees of the world: the real Engine and records, virtual time, and jobs steered in while it works. */
 export interface RouterWorld {
@@ -79,6 +87,8 @@ export interface RouterWorld {
   /** Records that a step took `jobs` into the Router's context; a candidate's Eval deadline starts here. */
   delivered(jobs: Job[]): void
   pump(): void
+  /** Runs commands whose events tell the Router nothing it did not do itself (the runtime's `quietly`). */
+  quietly<T>(run: () => T): T
   /** Runs a command the main Session issues; a refusal is recorded and returned as its message. */
   command<T>(run: () => T): T | { refused: string }
   /** Oracle only: the scenario's label, and the ticket of a task. */
@@ -97,6 +107,13 @@ export const oracleRouter: Router = {
     const wrong = () => world.random() < world.options.routerErrorRate
     for (const job of jobs) {
       if (job.kind === 'relay') { world.command(() => world.engine.reply({ purpose: 'result', ticketId: job.ticketId, text: 'Done.' })); continue }
+      if (job.kind === 'followup') {
+        // Its ticket's worker decides it; the main Session only stops the work when the person asks.
+        const label = world.truth(job.triggerId)
+        const ticketId = label?.kind === 'probe' && label.task && label.expect[0] === 'stop' ? world.ticketOf(label.task) : undefined
+        if (ticketId) world.command(() => world.engine.decide(job.triggerId, { kind: 'stop', ticketId, reason: { code: 'humanStop' } }))
+        continue
+      }
       const live = world.engine.candidate(job.candidate.triggers[0]!.id)
       if (!live || live.evalId !== job.candidate.evalId) continue
       // Attach follow-ups to their task's ticket first, as dispatch asks: cross-thread ones, and same-thread ones that came
@@ -147,7 +164,8 @@ export interface Score {
   /** Tickets created for no request: noise accepted, or a cross-thread follow-up accepted as new work instead of attached. */
   falseTickets: number
   noise: { reachedRouter: number; accepted: number }
-  cross: { total: number; reachedRouter: number; attachedRight: number; attachedWrong: number; acceptedAsNew: number; lost: number }
+  /** Cross-thread follow-ups; `moot` ones did not reach a ticket a person stopped no later than the Router decided them (so right). */
+  cross: { total: number; reachedRouter: number; attachedRight: number; attachedWrong: number; acceptedAsNew: number; lost: number; moot: number }
   /** Same-thread follow-ups, and those that reached their task's ticket (by subscription, or in the accepted batch). */
   followups: { total: number; fast: number }
   /**
@@ -162,6 +180,11 @@ export interface Score {
    * it ends work someone wanted, and a person's stop keeps the ticket from resuming).
    */
   stops: { right: number; wrong: number }
+  /**
+   * Mistakes weighted by what they cost (`HARM`): a wrong stop loses work someone wanted; a wrong attach subscribes a ticket
+   * to a whole thread for good; a false ticket wastes a worker; a lost follow-up or missed request needs saying again.
+   */
+  harm: number
   /** Per message that reached the Router: what it was and what the Router did with it, for error analysis. */
   routed: { triggerId: string; truth: Truth['kind']; outcome: string; reason?: string; text: string }[]
 }
@@ -285,6 +308,7 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
       stats.batches.push(delivered.length)
       stats.items += delivered.length
       for (const job of delivered) {
+        if (job.kind === 'followup') routed.add(job.triggerId)
         if (job.kind !== 'candidate') continue
         for (const trigger of job.candidate.triggers) {
           routed.add(trigger.id)
@@ -294,6 +318,7 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
       }
     },
     pump: () => pump(),
+    quietly: run => { quiet++; try { return run() } finally { quiet-- } },
     command: run => {
       try { return run() } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
@@ -402,7 +427,23 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   }
 
   // --- Engine ---------------------------------------------------------------------------------------------------
+  /** Commands run `quietly` (see `RouterWorld.quietly`), and the follow-ups already told to the Router. */
+  let quiet = 0
+  const told = new Set<string>()
   const emit = (event: DomainEvent) => {
+    if (o.followupNotices && !quiet && (event.type === 'trigger.received' || event.type === 'ticket.resumed' || event.type === 'trigger.followup')) {
+      const triggerId = event.data.triggerId
+      // As the runtime: a person's message that a live ticket's worker decides, told once.
+      later(0, () => {
+        const trigger = repo.triggers.get(triggerId)
+        const fanout = repo.triggers.disposition(triggerId)?.fanout ?? []
+        if (!trigger || told.has(triggerId) || !followupOwners(trigger, repo).length) return
+        if (!fanout.some(id => { const ticket = repo.tickets.get(id); return ticket && liveTicket(ticket) })) return
+        told.add(triggerId)
+        jobs.push({ kind: 'followup', triggerId })
+        kickRouter()
+      })
+    }
     if (event.type === 'decision.recorded') {
       result.decisions[event.data.kind] = (result.decisions[event.data.kind] ?? 0) + 1
       decisionIds.push(event.data.decisionId)
@@ -478,18 +519,33 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
 }
 
 /** Reads how every labelled message ended from the records, whatever Router decided it. */
+/** Weights of `Score.harm`, by what a mistake costs the team. */
+export const HARM = { wrongStop: 5, wrongAttach: 3, falseTicket: 2, lost: 2, other: 1 }
+
 export function score(scenario: Scenario, repo: MemoryRepositories, routed: ReadonlySet<string>, taskTicket: ReadonlyMap<string, string>,
   released: ReadonlySet<string> = new Set(), releasedRouted: ReadonlySet<string> = new Set()): Score {
   const s: Score = {
     requests: { total: 0, accepted: 0, missed: 0, reachedRouter: 0 }, falseTickets: 0, noise: { reachedRouter: 0, accepted: 0 },
-    cross: { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0 }, followups: { total: 0, fast: 0 },
-    probes: {}, stops: { right: 0, wrong: 0 }, routed: [], released: { total: 0, reachedRouter: 0, rescued: 0, lostAtRouter: 0, lostAtGate: 0 },
+    cross: { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0, moot: 0 }, followups: { total: 0, fast: 0 },
+    probes: {}, stops: { right: 0, wrong: 0 }, harm: 0, routed: [], released: { total: 0, reachedRouter: 0, rescued: 0, lostAtRouter: 0, lostAtGate: 0 },
   }
   const decisionOf = (id: string) => {
     const decisionId = repo.triggers.disposition(id)?.decisionId
     return decisionId ? repo.decisions.get(decisionId) : undefined
   }
   const requestTickets = new Set<string>()
+  /** When a person's stop (a hard case that asked for it) ended each task's ticket. */
+  const personStop = new Map<string, string>()
+  for (const event of scenario.events) {
+    const label = event.truth
+    const decision = decisionOf(event.id)
+    if (label.kind !== 'probe' || !label.task || !label.expect.includes('stop') || decision?.kind !== 'stop') continue
+    if (decision.ticketId !== taskTicket.get(label.task)) continue
+    const earlier = personStop.get(label.task)
+    if (!earlier || decision.at < earlier) personStop.set(label.task, decision.at)
+  }
+  let otherProbeErrors = 0
+  let wrongAttaches = 0
   /** Tickets a hard case rightly started (new work phrased indirectly, or on a similar subject); not false. */
   const probeTickets = new Set<string>()
   for (const event of scenario.events) {
@@ -522,6 +578,7 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
       if (decision?.kind === 'accept' && decision.ticketId !== right) s.cross.acceptedAsNew++
       else if (right && fanout.includes(right)) s.cross.attachedRight++
       else if (fanout.length) s.cross.attachedWrong++
+      else if (personStop.has(label.task) && (!decision || decision.at >= personStop.get(label.task)!)) s.cross.moot++
       else s.cross.lost++
     } else if (label.kind === 'probe') {
       const tally = s.probes[label.probe] ??= { total: 0, reachedRouter: 0, right: 0, outcomes: {} }
@@ -536,6 +593,9 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
       else if (decision?.kind === 'unavailable' || !decision) ended = 'expired'
       else ended = 'ignore'
       tally.outcomes[ended] = (tally.outcomes[ended] ?? 0) + 1
+      // A wrong stop, attach or accept is weighed as such (a wrong accept as a false ticket); any other wrong outcome weighs 1.
+      if (ended === 'attach-wrong') wrongAttaches++
+      else if (!(label.expect as string[]).includes(ended) && ended !== 'accept' && ended !== 'stop-wrong') otherProbeErrors++
       if ((label.expect as string[]).includes(ended)) {
         tally.right++
         if (ended === 'accept' && decision?.ticketId) probeTickets.add(decision.ticketId)
@@ -548,6 +608,8 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
     }
   }
   for (const ticket of repo.tickets.list()) if (!requestTickets.has(ticket.id) && !probeTickets.has(ticket.id)) s.falseTickets++
+  s.harm = HARM.wrongStop * s.stops.wrong + HARM.wrongAttach * (s.cross.attachedWrong + wrongAttaches) + HARM.falseTicket * s.falseTickets
+    + HARM.lost * (s.cross.lost + s.requests.missed) + HARM.other * otherProbeErrors
   for (const event of scenario.events) {
     const label = event.truth
     if (!released.has(event.id) || (label.kind !== 'cross' && label.kind !== 'followup')) continue

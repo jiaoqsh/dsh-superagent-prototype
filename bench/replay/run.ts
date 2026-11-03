@@ -42,16 +42,22 @@ export interface Summary {
   cardsPerMin: number
   released: SimResult['score']['released']
   stops: SimResult['score']['stops']
-  model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencyP50: number; latencyP95: number; toolCalls: Record<string, number> }
+  /** `Score.harm`, pooled, and hard cases right per seed (the spread between runs). */
+  harm: number
+  probeSeeds: number[]
+  model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencyP50: number; latencyP95: number; toolCalls: Record<string, number>; retries: number; slowCalls: number }
   errors: string[]
 }
+/** A model call slower than this hints the API was overloaded; its wall time passed on the virtual clock. */
+const SLOW_CALL_SEC = 30
+
 export function summarize(label: string, results: (SimResult & { window?: number; arrivals?: number })[]): Summary {
   const requests = results.flatMap(r => r.requests)
   const acks = requests.flatMap(r => r.ackAt !== undefined ? [r.ackAt - r.arrivedAt] : [])
   const done = requests.flatMap(r => r.resultAt !== undefined ? [r.resultAt - r.arrivedAt] : [])
   const stats = results.map(r => r.routerStats)
   const models = stats.flatMap(st => st.model ? [st.model] : [])
-  const cross = { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0 }
+  const cross = { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0, moot: 0 }
   for (const r of results) for (const k of Object.keys(cross) as (keyof typeof cross)[]) cross[k] += r.score.cross[k]
   const probes: Summary['probes'] = {}
   for (const r of results) for (const [kind, tally] of Object.entries(r.score.probes)) {
@@ -64,6 +70,8 @@ export function summarize(label: string, results: (SimResult & { window?: number
   return {
     label, runs: results.length, probes, released,
     stops: { right: sum(results, r => r.score.stops.right), wrong: sum(results, r => r.score.stops.wrong) },
+    harm: sum(results, r => r.score.harm),
+    probeSeeds: results.map(r => Object.values(r.score.probes).reduce((n, t) => n + t.right, 0)),
     cardsPerMin: sum(results, r => r.arrivals ?? 0) / Math.max(1, sum(results, r => r.window ?? 1)),
     requests: requests.length, accepted: sum(results, r => r.score.requests.accepted), completed: done.length,
     ackP50: quantile(acks, 0.5), ackP95: quantile(acks, 0.95), resultP50: quantile(done, 0.5), resultP95: quantile(done, 0.95),
@@ -82,6 +90,7 @@ export function summarize(label: string, results: (SimResult & { window?: number
       completionTokens: sum(models, m => m.completionTokens),
       latencyP50: quantile(models.flatMap(m => m.latencySec), 0.5), latencyP95: quantile(models.flatMap(m => m.latencySec), 0.95),
       toolCalls: models.reduce<Record<string, number>>((a, m) => { for (const [k, v] of Object.entries(m.toolCalls)) a[k] = (a[k] ?? 0) + v; return a }, {}),
+      retries: sum(models, m => m.retries ?? 0), slowCalls: models.flatMap(m => m.latencySec).filter(sec => sec > SLOW_CALL_SEC).length,
     } } : {},
     errors: results.flatMap(r => r.errors),
   }
@@ -141,13 +150,14 @@ const JUDGEMENT: [string, (row: Summary) => string][] = [
   ['requests accepted', r => `${r.accepted}/${r.requests}`],
   ['noise→ticket', r => `${r.noiseAccepted}/${r.noiseAtRouter}`],
   ['false tickets', r => String(r.falseTickets)],
-  ['cross@router right/wrong/new/lost', r => `${r.cross.attachedRight}/${r.cross.attachedWrong}/${r.cross.acceptedAsNew}/${r.cross.lost} of ${r.cross.reachedRouter}`],
+  ['cross@router right/wrong/new/lost', r => `${r.cross.attachedRight}/${r.cross.attachedWrong}/${r.cross.acceptedAsNew}/${r.cross.lost}${r.cross.moot ? ` (+${r.cross.moot} moot)` : ''} of ${r.cross.reachedRouter}`],
   ['ack p50/p95', r => `${s(r.ackP50)}/${s(r.ackP95)}`],
   ['batch mean/max', r => `${r.meanBatch.toFixed(2)}/${r.maxBatch}`],
   ['unavail', r => String(r.unavailable)],
   ['refusals', r => String(r.refusals)],
   ['calls', r => String(r.model?.calls ?? '—')],
   ['latency p50/p95', r => r.model ? `${s(r.model.latencyP50)}/${s(r.model.latencyP95)}` : '—'],
+  ['retries/slow', r => r.model ? `${r.model.retries}/${r.model.slowCalls}` : '—'],
   ['tokens in(cached)/out', r => r.model ? `${(r.model.promptTokens / 1000).toFixed(0)}k(${(r.model.cachedTokens / 1000).toFixed(0)}k)/${(r.model.completionTokens / 1000).toFixed(1)}k` : '—'],
 ]
 
@@ -179,6 +189,11 @@ const HARD: Partial<GenerateOptions> = { durationSec: 1800, requests: 8, noise: 
  * tasks a refusal right after the same person asked about the task (`declineAfter`).
  */
 const STOPS: Partial<GenerateOptions> = { ...HARD, globalProbes: 6, globalKinds: ['decline'], contextDeclines: 3 }
+/**
+ * Scripted hard cases: twelve tasks over 40 minutes with the hard cases of `HARD`, two refusals right after a status question
+ * (`declineAfter`), and two stops and two refusals on a task's own thread (`threadStop`, `threadDecline`).
+ */
+const SCRIPTED: Partial<GenerateOptions> = { ...HARD, durationSec: 2400, requests: 12, contextDeclines: 2, threadProbes: 4 }
 /** Saturation: the hard mix at nominally `perMin` cards per minute to the Router over 4 minutes, follow-ups trailing after it (requests, their cross-thread follow-ups and hard cases, small talk). */
 const saturating = (perMin: number): Partial<GenerateOptions> => {
   const cards = perMin * 4
@@ -217,21 +232,21 @@ const MODELS = (process.env.ROUTER_MODELS ?? 'deepseek-flash,deepseek-v4-pro').s
  * One model row per dispatch text over `scenario`: the dispatch section as committed at DISPATCH_BEFORE (a git revision, default
  * HEAD; '' skips it), then the texts in DISPATCH_FILES (comma-separated paths), else the working tree's.
  */
-async function dispatchRows(scenario: Partial<GenerateOptions>): Promise<Summary[]> {
+async function dispatchRows(scenario: Partial<GenerateOptions>, sim: Partial<SimOptions> = {}): Promise<Summary[]> {
   const { execFileSync } = await import('node:child_process')
   const { readFile } = await import('node:fs/promises')
   const revision = process.env.DISPATCH_BEFORE ?? 'HEAD'
   const rows: Summary[] = []
   if (revision) {
     const before = execFileSync('git', ['show', `${revision}:prompts/dispatch.md`], { encoding: 'utf8' }).trimEnd()
-    rows.push(await pooled(`dispatch@${revision}`, scenario, { maxWorkers: 16 }, await model(undefined, { dispatch: before })))
+    rows.push(await pooled(`dispatch@${revision}`, scenario, { maxWorkers: 16, ...sim }, await model(undefined, { dispatch: before })))
   }
   const files = (process.env.DISPATCH_FILES ?? '').split(',').filter(Boolean)
   for (const file of files) {
     const text = (await readFile(file, 'utf8')).trimEnd()
-    rows.push(await pooled(`dispatch ${file.split('/').at(-1)}`, scenario, { maxWorkers: 16 }, await model(undefined, { dispatch: text })))
+    rows.push(await pooled(`dispatch ${file.split('/').at(-1)}`, scenario, { maxWorkers: 16, ...sim }, await model(undefined, { dispatch: text })))
   }
-  if (!files.length) rows.push(await pooled('dispatch (working tree)', scenario, { maxWorkers: 16 }, await model()))
+  if (!files.length) rows.push(await pooled('dispatch (working tree)', scenario, { maxWorkers: 16, ...sim }, await model()))
   return rows
 }
 
@@ -282,6 +297,15 @@ const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: type
    * Stop targets (#10): the hard mix with refusals instead of the other hard cases about no task, some right after the same
    * person asked about a task, compared like model-prompt (DISPATCH_BEFORE, DISPATCH_FILES); ORACLE_ONLY=1 checks the scenario.
    */
+  /**
+   * Scripted hard cases (#7) with follow_up notices: every hard case, refusals right after a status question, and stops and
+   * refusals on a task's own thread, which reach the ticket and the Router hears of by notice; compared like model-prompt.
+   */
+  'model-script': async () => {
+    const rows = [await pooled('oracle', SCRIPTED, { maxWorkers: 16, followupNotices: true })]
+    if (!process.env.ORACLE_ONLY) rows.push(...await dispatchRows(SCRIPTED, { followupNotices: true }))
+    return { rows, columns: JUDGEMENT, probes: true }
+  },
   'model-stop': async () => {
     const rows = [await pooled('oracle', STOPS, { maxWorkers: 16 })]
     if (!process.env.ORACLE_ONLY) rows.push(...await dispatchRows(STOPS))
@@ -326,13 +350,21 @@ else {
     console.log('\n## Hard cases: right/total (outcomes)\n')
     const kinds = [...new Set(rows.flatMap(row => Object.keys(row.probes)))]
     const all = (row: Summary) => Object.values(row.probes).reduce((a, t) => [a[0]! + t.right, a[1]! + t.total], [0, 0])
-    table(rows, [['case', r => r.label], ['all', r => `${all(r)[0]}/${all(r)[1]}`], ['stops right/wrong', r => `${r.stops.right}/${r.stops.wrong}`], ...kinds.map(kind => [kind, (r: Summary) => {
+    const spread = (r: Summary) => r.probeSeeds.length > 1 ? ` (${Math.min(...r.probeSeeds)}–${Math.max(...r.probeSeeds)})` : ''
+    table(rows, [['case', r => r.label], ['all (per seed)', r => `${all(r)[0]}/${all(r)[1]}${spread(r)}`], ['harm', r => String(r.harm)],
+      ['stops right/wrong', r => `${r.stops.right}/${r.stops.wrong}`], ...kinds.map(kind => [kind, (r: Summary) => {
       const t = r.probes[kind]
       if (!t) return '—'
       const wrong = Object.entries(t.outcomes).filter(([outcome]) => !PROBE_EXPECT[kind as keyof typeof PROBE_EXPECT].includes(outcome as never))
       return `${t.right}/${t.total}${wrong.length ? ` (${wrong.map(([o, n]) => `${o}:${n}`).join(' ')})` : ''}`
     }] as [string, (row: Summary) => string])])
   }
+}
+// A row whose Router failed, retried or waited long on the API ran in another world than the others: say so.
+const degraded = rows.filter(row => row.errors.length || (row.model && (row.model.retries || row.model.slowCalls)))
+if (degraded.length && !args.includes('--json')) {
+  console.log(`\n## Degraded rows (API errors, retries, or calls over ${SLOW_CALL_SEC} s): compare with care or rerun\n`)
+  for (const row of degraded) console.log(`- ${row.label}: ${row.errors.length} router error(s), ${row.model?.retries ?? 0} retries, ${row.model?.slowCalls ?? 0} slow calls${row.errors[0] ? `; first: ${row.errors[0].slice(0, 160)}` : ''}`)
 }
 const out = flag('--out')
 if (out) await writeFile(out, JSON.stringify({ rows, results: all.map(r => ({ ...r, requests: r.requests, score: r.score })) }, null, 2))

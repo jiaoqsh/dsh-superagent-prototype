@@ -1,4 +1,4 @@
-import { ADDRESSED_NOISE, DECLINE_AFTER, GLOBAL_PROBES, NOISE, TASKS, type GlobalProbe, type TaskProbe } from './corpus.ts'
+import { ADDRESSED_NOISE, DECLINE_AFTER, GLOBAL_PROBES, NOISE, TASKS, THREAD_PROBES, type GlobalProbe, type TaskProbe } from './corpus.ts'
 
 /**
  * Replay scenarios: a timed message stream with a ground-truth label per message, so a run can be scored.
@@ -21,7 +21,7 @@ export type Truth =
   | { kind: 'probe'; probe: ProbeKind; task?: string; expect: ProbeOutcome[]; extraSec: number }
 
 /** A hard case: about a task, about none, or a refusal whose task only the context names (`DECLINE_AFTER`). */
-export type ProbeKind = TaskProbe | GlobalProbe | 'declineAfter'
+export type ProbeKind = TaskProbe | GlobalProbe | 'declineAfter' | keyof typeof THREAD_PROBES
 
 /** How a message ended: a new ticket, attached to its task's ticket, its task's ticket stopped, or no ticket at all. */
 export type ProbeOutcome = 'accept' | 'attach' | 'stop' | 'ignore'
@@ -36,6 +36,9 @@ export const PROBE_EXPECT: Record<ProbeKind, ProbeOutcome[]> = {
   vague: ['ignore'], question: ['ignore'], hold: ['ignore'], decline: ['ignore'], polite: ['accept'],
   // The person just asked about that task: stopping it is right, asking which work they mean is too.
   declineAfter: ['stop', 'ignore'],
+  // On the task's own thread: the message reaches the ticket (attach); the Router must stop it on a stop, and may on a refusal,
+  // which the ticket's worker otherwise decides.
+  threadStop: ['stop'], threadDecline: ['stop', 'attach'],
 }
 
 /**
@@ -85,6 +88,11 @@ export interface GenerateOptions {
    * status (its `status` probe, added when it has none) declines 45 s later without naming it; later follow-ups come before.
    */
   contextDeclines?: number
+  /**
+   * On up to this many further tasks without a stop, the person who asked ends it on the task's own thread at 90% of its work
+   * time, alternately with a stop (`threadStop`) and a refusal (`threadDecline`); follow-ups come before.
+   */
+  threadProbes?: number
   /** Indices into `TASKS` in the order requests use them; default in order. */
   taskOrder?: number[]
 }
@@ -117,6 +125,7 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
   const guests = ['dave', 'erin']
   const events: Omit<ScenarioEvent, 'id'>[] = []
   let declined = 0
+  let threaded = 0
   for (let i = 0; i < o.requests; i++) {
     const task = `task-${i}`
     const thread = `oc_team:om_req${i}`
@@ -145,6 +154,12 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
       events.push({ at: stopAt, thread: `oc_team:om_probe${i}-declineAfter`, actor: status.by, human: true, addressed: true,
         text: DECLINE_AFTER[declined % DECLINE_AFTER.length]!, truth: { kind: 'probe', probe: 'declineAfter', task, expect: PROBE_EXPECT.declineAfter, extraSec: 0 } })
       declined++
+    } else if (stopAt === Infinity && threaded < (o.threadProbes ?? 0)) {
+      const kind = threaded % 2 ? 'threadDecline' : 'threadStop'
+      stopAt = at + Math.round(workSec * 0.9)
+      events.push({ at: stopAt, thread, actor, human: true, addressed: true, text: THREAD_PROBES[kind][Math.floor(threaded / 2) % 3]!,
+        truth: { kind: 'probe', probe: kind, task, expect: PROBE_EXPECT[kind], extraSec: 0 } })
+      threaded++
     }
     // Each follow-up text once per task: the j-th of a kind takes text j where it is free, else the first free one, else
     // the follow-up becomes the other kind, so no task repeats a message word for word.
