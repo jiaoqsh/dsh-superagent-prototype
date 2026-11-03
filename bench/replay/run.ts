@@ -3,7 +3,8 @@
  *
  *   node --experimental-transform-types --no-warnings bench/replay/run.ts <experiment> [--json] [--runs N] [--out file.json]
  *
- * Oracle experiments (deterministic, free): baseline, sweep-rate, sweep-router, sweep-workers, sweep-errors, sweep-poll, sweep-cross.
+ * Oracle experiments (deterministic, free): baseline, sweep-rate, sweep-router, sweep-workers, sweep-errors, sweep-poll, sweep-cross,
+ * fault-hang.
  * Model experiments (call the API in DEEPSEEK_API_KEY, model ROUTER_MODEL or deepseek-flash): model-small, model-burst,
  * model-hard (oracle and every model in ROUTER_MODELS, default deepseek-flash,deepseek-v4-pro), model-saturation, model-batch,
  * model-released, model-prompt, model-stop.
@@ -45,6 +46,8 @@ export interface Summary {
   /** `Score.harm`, pooled, and hard cases right per seed (the spread between runs). */
   harm: number
   probeSeeds: number[]
+  /** Injected hangs, pooled (`SimResult.faults`). */
+  faults: { hung: number; noticed: number; unnoticed: number; noticeP50: number; slotHours: number; neverStarted: number; stalledRuns: number }
   model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencyP50: number; latencyP95: number; toolCalls: Record<string, number>; retries: number; slowCalls: number }
   errors: string[]
 }
@@ -71,6 +74,9 @@ export function summarize(label: string, results: (SimResult & { window?: number
     label, runs: results.length, probes, released,
     stops: { right: sum(results, r => r.score.stops.right), wrong: sum(results, r => r.score.stops.wrong) },
     harm: sum(results, r => r.score.harm),
+    faults: { hung: sum(results, r => r.faults.hung), noticed: sum(results, r => r.faults.detectedSec.length), unnoticed: sum(results, r => r.faults.unnoticed),
+      noticeP50: quantile(results.flatMap(r => r.faults.detectedSec), 0.5), slotHours: sum(results, r => r.faults.slotSec) / 3600,
+      neverStarted: sum(results, r => r.faults.neverStarted), stalledRuns: results.filter(r => r.faults.neverStarted > 0).length },
     probeSeeds: results.map(r => Object.values(r.score.probes).reduce((n, t) => n + t.right, 0)),
     cardsPerMin: sum(results, r => r.arrivals ?? 0) / Math.max(1, sum(results, r => r.window ?? 1)),
     requests: requests.length, accepted: sum(results, r => r.score.requests.accepted), completed: done.length,
@@ -144,6 +150,19 @@ const SCHEDULING: [string, (row: Summary) => string][] = [
   ['gate drop', r => String(r.gateRejected)],
   ['evals', r => String(r.evals)],
   ['slot wait p95', r => min(r.slotWaitP95)],
+]
+/** Injected worker hangs (#8): what they cost the team, and what a Watchdog changes. */
+const FAULTS: [string, (row: Summary) => string][] = [
+  ['case', r => r.label],
+  ['req', r => String(r.requests)],
+  ['done', r => String(r.completed)],
+  ['result p50/p95', r => `${min(r.resultP50)}/${min(r.resultP95)}`],
+  ['slot wait p95', r => min(r.slotWaitP95)],
+  ['hung', r => String(r.faults.hung)],
+  ['noticed (p50 after)', r => r.faults.noticed ? `${r.faults.noticed} (${min(r.faults.noticeP50)})` : '0'],
+  ['never noticed', r => String(r.faults.unnoticed)],
+  ['slot-hours held', r => `${r.faults.unnoticed ? '≥' : ''}${r.faults.slotHours.toFixed(1)}`],
+  ['never started (runs)', r => `${r.faults.neverStarted} (${r.faults.stalledRuns})`],
 ]
 const JUDGEMENT: [string, (row: Summary) => string][] = [
   ['case', r => r.label],
@@ -252,6 +271,18 @@ async function dispatchRows(scenario: Partial<GenerateOptions>, sim: Partial<Sim
 
 const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: typeof SCHEDULING; probes?: boolean }>> = {
   baseline: async () => ({ rows: [await pooled('baseline', {}, {})], columns: SCHEDULING }),
+  /**
+   * Worker hangs (#8): the baseline hour with HANG_RATE (default 0.15) of first assignments hanging, without a Watchdog (as in
+   * the prototype) and with one at each of WATCHDOG_MIN (default 60,30,20,10 minutes of no activity).
+   */
+  'fault-hang': async () => {
+    const rate = Number(process.env.HANG_RATE ?? 0.15)
+    const rows = [await pooled('no faults', {}, {}), await pooled(`hang ${rate * 100}%, no watchdog`, {}, { hangRate: rate })]
+    for (const minutes of (process.env.WATCHDOG_MIN ?? '60,30,20,10').split(',').map(Number)) {
+      rows.push(await pooled(`hang ${rate * 100}%, watchdog ${minutes} min`, {}, { hangRate: rate, watchdogSec: minutes * 60 }))
+    }
+    return { rows, columns: FAULTS }
+  },
   'sweep-rate': async () => ({ rows: await sequence([3600, 1200, 600, 300, 120], duration =>
     pooled(`window ${duration / 60}m`, { durationSec: duration, workSec: [60, 180], extraSec: [30, 90] }, {})), columns: SCHEDULING }),
   /** §7.2: Router-bound rate from ~1 to ~60 per minute over 10 minutes (half requests, half addressed small talk), workers not limiting. */

@@ -15,6 +15,7 @@ Options: `--runs N` (seeds per row, default 10), `--json`, `--out file.json` (ro
 | `baseline`, `sweep-workers`, `sweep-poll`, `sweep-rate` | oracle | Latency and capacity: where time goes |
 | `sweep-router` | oracle | The article's §7.2 batching curve (a consistency check: step time is fitted to it) |
 | `sweep-cross`, `sweep-errors` | oracle | How many cross-thread follow-ups survive the gate; how Router mistakes propagate |
+| `fault-hang` | oracle | Worker hangs (#8): `HANG_RATE` (default 0.15) of first assignments hang, holding their slot; without a Watchdog (the prototype has no timer for a running turn) and with one per `WATCHDOG_MIN` (default 60,30,20,10 minutes of no activity), which ends the turn as failed and frees the slot. `activity-gaps.py` measures how long healthy agent turns go without a step, from Claude Code transcripts, for the false alarms of each threshold |
 | `model-small` | oracle vs model | Judgement on a small team hour (D1/D3/D4) |
 | `model-burst` | oracle vs model | Judgement on a short burst |
 | `model-hard` | oracle vs each model in `ROUTER_MODELS` | Hard cases: sibling tickets, stop, status, duplicate, similar new request, vague reference, question, hold, refusal, indirect request |
@@ -38,7 +39,7 @@ concurrently.
 | Gate (who may originate work, follow-ups, accept mode) | Real (`settingsPolicy`) |
 | Main Session (Router), oracle | One server; a step takes every queued card; step time `routerBaseSec + routerPerItemSec × items` (defaults fit the article's §7.2: 2.5 s at 1 item, 3.9 s at 2.8). Decisions come from the scenario's ground truth, flipped with `routerErrorRate` |
 | Main Session (Router), model (`llm-router.ts`) | The real system prompt (`composePrompt`), tools (`mainTools`), candidate cards (`candidateCard`), worker report relays (`resultRelay`) and resource reader (`readResource`) over a real model. Each call's wall time passes on the virtual clock, and cards that arrive meanwhile are steered into the same turn. Simplified: a fixed history cap instead of DSH compaction, no DSH system prompt or skills, settings/prompt/inferred-assessment tools answer unavailable. follow_up notices (`followupNotice`) only with `followupNotices` (`model-script`), so earlier experiments stay comparable |
-| Workers | `maxWorkers` slots, `launchSec` to start, inputs read after `workerStepSec`, work time from the scenario |
+| Workers | `maxWorkers` slots, `launchSec` to start, inputs read after `workerStepSec`, work time from the scenario; one launch per assignment however often the Engine asks (before 2026-11-03 a second ask relaunched a running assignment, restarting its work, which inflated slot waits by about a fifth) |
 | Sources | A message waits a uniform share of `pollSec` before intake (0 = push) |
 | Repositories | `MemoryRepositories` |
 
