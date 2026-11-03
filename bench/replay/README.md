@@ -20,6 +20,7 @@ Options: `--runs N` (seeds per row, default 10), `--json`, `--out file.json` (ro
 | `model-hard` | oracle vs each model in `ROUTER_MODELS` | Hard cases: sibling tickets, stop, status, duplicate, similar new request, vague reference, question, hold, refusal, indirect request |
 | `model-saturation` | model | The hard mix at rising rates (nominal 20/60/120 per minute, `SAT_RATES`). Confounded at high rates: tasks repeat and short tickets end early (released inputs come back to Eval), so use `model-batch` for D2 |
 | `model-released` | oracle, model, model + fix | Follow-ups a ticket lets go unread when it ends (`Tickets.letGo`): how many the Router recovers with `released` on cards and its dispatch rule, and without them (`released: false` in `llm-router.ts`; `SKIP_BASELINE=1` skips that row). `WORKER_STEP` sets how long a worker takes to read new input (default 60 s) |
+| `model-prompt` | model per dispatch text | A dispatch prompt change: the dispatch section at `DISPATCH_BEFORE` (a git revision, default `HEAD`) against the working tree's, or the texts in `DISPATCH_FILES` (comma-separated paths), one row each, over the hard cases |
 | `model-batch` | oracle and model per size | D2, controlled: a fixed hard mix (no repeated task, tickets open throughout) with the Router held until `minBatch` cards wait (1/5/10/20, `BATCH_SIZES`); judgement only, the hold inflates acknowledgement times |
 
 Model experiments read `DEEPSEEK_API_KEY` from the environment or `.env`; `ROUTER_BASE_URL` (default

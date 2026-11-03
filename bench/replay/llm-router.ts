@@ -31,6 +31,8 @@ export interface ModelConfig {
    * dispatch has no rule for it. Default on, as the product is.
    */
   released?: boolean
+  /** Text in place of the built-in dispatch section (`runtime/dispatch`), to compare a prompt change against the one it replaces. */
+  dispatch?: string
   /** Called with each model step, for logging. */
   onStep?: (step: { atSec: number; latencySec: number; jobs: number; toolCalls: string[]; text?: string }) => void
 }
@@ -109,7 +111,9 @@ export function modelRouter(config: ModelConfig): Router {
     toolSpecs = tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description,
       parameters: z.toJSONSchema(tool.schema, { io: 'input', unrepresentable: 'any' }) } }))
     const linkHost = { store, links: new TextCache(1_000_000), commands: unavailable('commands'), sources, lifetime: new AbortController().signal }
-    const composed = composePrompt(defaultPrompts(), 'orchestrator', undefined, policySection(settings))
+    const prompts = config.dispatch === undefined ? defaultPrompts()
+      : { ...defaultPrompts(), overrides: { 'runtime/dispatch': { text: `## dispatch\n${config.dispatch}` } } }
+    const composed = composePrompt(prompts, 'orchestrator', undefined, policySection(settings, prompts))
     // Without `released`, the dispatch rule for it goes too (the composed prompt joins dispatch.md's lines with spaces).
     const system = config.released === false ? composed.replace(/ ?released: a ticket ended before[^]*?as any other message\./, '') : composed
     if (config.released === false && system === composed) throw new Error('the released rule was not found in the prompt')
@@ -145,19 +149,21 @@ export function modelRouter(config: ModelConfig): Router {
   async function complete(world: RouterWorld): Promise<Completion> {
     for (let attempt = 0; ; attempt++) {
       let response: Response
+      let body: string
       try {
         response = await fetch(`${config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
           method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
           body: JSON.stringify({ model: config.model, messages, tools: toolSpecs, tool_choice: 'auto' }),
         })
+        // The body is read inside the retry too: a connection can drop while it streams.
+        body = await response.text()
+        if (response.ok) return JSON.parse(body) as Completion
       } catch (error) {
         // A dropped connection is retried like a 5xx; DSH retries model calls the same way.
-        if (attempt < 4) { await new Promise(resolve => setTimeout(resolve, 2000 * 2 ** attempt)); continue }
+        if (attempt < 5) { await new Promise(resolve => setTimeout(resolve, 2000 * 2 ** attempt)); continue }
         throw error
       }
-      if (response.ok) return await response.json() as Completion
-      const body = await response.text()
-      if (attempt < 4 && (response.status === 429 || response.status >= 500)) {
+      if (attempt < 5 && (response.status === 429 || response.status >= 500)) {
         await new Promise(resolve => setTimeout(resolve, 2000 * 2 ** attempt))
         continue
       }
