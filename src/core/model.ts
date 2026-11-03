@@ -55,6 +55,11 @@ export interface TriggerDisposition {
   requeued?: true
   /** The tickets whose Executor handed it back as beyond the ticket, each once, with why; it goes to Eval once none decides it. */
   handbacks?: { ticketId: string; reason: string; at: string }[]
+  /**
+   * The tickets that ended, or could not resume, before their Executor took it up, so they let it go and it went to Eval
+   * again (`Tickets.letGo`), each once, last time kept. It was no duplicate delivery: no worker acted on it.
+   */
+  released?: { ticketId: string; at: string }[]
   /** The tickets whose Executor acknowledged it or answered it, taking it up as within the ticket. */
   acked?: string[]
   at: string

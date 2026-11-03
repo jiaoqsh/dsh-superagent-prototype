@@ -49,6 +49,8 @@ const RULES: [rule: string, file: string, says: string[], gone?: string[]][] = [
     ['the ticket\'s worker decides whether it belongs to the ticket and hands back what does not']],
   ['A person\'s follow-up is its ticket\'s worker\'s to decide; the main Session only stops the work on request', 'dispatch',
     ['a human follow-up becomes new work only once its ticket\'s worker hands it back'], ['related human follow-ups can']],
+  ['A message an ended ticket let go unread is no duplicate delivery', 'dispatch',
+    ['released: a ticket ended before its worker took the message up', 'it is no duplicate delivery and no worker acted on it']],
   ['A question for a person is asked through the report, not left where nobody reads it', 'work',
     ['Do not leave the question only in summary, GitHub or the Session and wait.']],
   ['A person\'s follow-up is its ticket\'s worker\'s to decide; the main Session only stops the work on request', 'work',
