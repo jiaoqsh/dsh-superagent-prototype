@@ -148,7 +148,7 @@ const JUDGEMENT: [string, (row: Summary) => string][] = [
   ['tokens in(cached)/out', r => r.model ? `${(r.model.promptTokens / 1000).toFixed(0)}k(${(r.model.cachedTokens / 1000).toFixed(0)}k)/${(r.model.completionTokens / 1000).toFixed(1)}k` : '—'],
 ]
 
-async function model(name = process.env.ROUTER_MODEL ?? 'deepseek-flash', extra: { released?: boolean } = {}): Promise<() => Router> {
+async function model(name = process.env.ROUTER_MODEL ?? 'deepseek-flash', extra: { released?: boolean; dispatch?: string } = {}): Promise<() => Router> {
   await loadEnv()
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error('DEEPSEEK_API_KEY is not set (put it in .env)')
@@ -242,6 +242,26 @@ const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: type
     const router = await model()
     return { rows: await sequence((process.env.SAT_RATES ?? '20,60,120').split(',').map(Number), perMin => pooled(`${perMin}/min`, saturating(perMin), { maxWorkers: 16 }, router)),
       columns: [...JUDGEMENT.slice(0, 1), ['arrivals/min', r => r.cardsPerMin.toFixed(0)], ...JUDGEMENT.slice(1)], probes: true }
+  },
+  /**
+   * A dispatch prompt change: the hard cases with the dispatch section as committed at DISPATCH_BEFORE (a git revision, default
+   * HEAD) against the working tree's, in one process (ROUTER_MODEL).
+   */
+  'model-prompt': async () => {
+    const { execFileSync } = await import('node:child_process')
+    const revision = process.env.DISPATCH_BEFORE ?? 'HEAD'
+    const before = revision ? execFileSync('git', ['show', `${revision}:prompts/dispatch.md`], { encoding: 'utf8' }).trimEnd() : ''
+    // DISPATCH_FILES compares dispatch texts from files instead (comma-separated paths), each a row; DISPATCH_BEFORE='' skips the revision's row.
+    const { readFile } = await import('node:fs/promises')
+    const rows: Summary[] = []
+    if (revision) rows.push(await pooled(`dispatch@${revision}`, HARD, { maxWorkers: 16 }, await model(undefined, { dispatch: before })))
+    const files = (process.env.DISPATCH_FILES ?? '').split(',').filter(Boolean)
+    for (const file of files) {
+      const text = (await readFile(file, 'utf8')).trimEnd()
+      rows.push(await pooled(`dispatch ${file.split('/').at(-1)}`, HARD, { maxWorkers: 16 }, await model(undefined, { dispatch: text })))
+    }
+    if (!files.length) rows.push(await pooled('dispatch (working tree)', HARD, { maxWorkers: 16 }, await model()))
+    return { rows, columns: JUDGEMENT, probes: true }
   },
   /** Released follow-ups: the Router with `released` cards and their dispatch rule, and without them (SKIP_BASELINE=1 skips that row). */
   'model-released': async () => {
