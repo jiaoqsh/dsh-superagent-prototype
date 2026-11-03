@@ -5,7 +5,8 @@
  *
  * Oracle experiments (deterministic, free): baseline, sweep-rate, sweep-router, sweep-workers, sweep-errors, sweep-poll, sweep-cross.
  * Model experiments (call the API in DEEPSEEK_API_KEY, model ROUTER_MODEL or deepseek-flash): model-small, model-burst,
- * model-hard (oracle and every model in ROUTER_MODELS, default deepseek-flash,deepseek-v4-pro), model-saturation, model-batch.
+ * model-hard (oracle and every model in ROUTER_MODELS, default deepseek-flash,deepseek-v4-pro), model-saturation, model-batch,
+ * model-released, model-prompt, model-stop.
  * Model runs of one row run their seeds concurrently.
  */
 import { writeFile } from 'node:fs/promises'
@@ -40,6 +41,7 @@ export interface Summary {
   /** Addressed messages per minute within the generation window: the peak rate offered to the Router. */
   cardsPerMin: number
   released: SimResult['score']['released']
+  stops: SimResult['score']['stops']
   model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencyP50: number; latencyP95: number; toolCalls: Record<string, number> }
   errors: string[]
 }
@@ -61,6 +63,7 @@ export function summarize(label: string, results: (SimResult & { window?: number
   for (const r of results) for (const k of Object.keys(released) as (keyof typeof released)[]) released[k] += r.score.released[k]
   return {
     label, runs: results.length, probes, released,
+    stops: { right: sum(results, r => r.score.stops.right), wrong: sum(results, r => r.score.stops.wrong) },
     cardsPerMin: sum(results, r => r.arrivals ?? 0) / Math.max(1, sum(results, r => r.window ?? 1)),
     requests: requests.length, accepted: sum(results, r => r.score.requests.accepted), completed: done.length,
     ackP50: quantile(acks, 0.5), ackP95: quantile(acks, 0.95), resultP50: quantile(done, 0.5), resultP95: quantile(done, 0.95),
@@ -171,6 +174,11 @@ const BURST: Partial<GenerateOptions> = { durationSec: 180, requests: 12, noise:
  */
 const HARD: Partial<GenerateOptions> = { durationSec: 1800, requests: 8, noise: 30, addressedNoise: 4, followupsPerRequest: 2, crossFraction: 0.5,
   crossAddressed: 1, ciPerRequest: 0, workSec: [900, 1500], extraSec: [60, 180], probesPerRequest: 2, globalProbes: 10, taskOrder: HARD_ORDER }
+/**
+ * Stop targets: the hard mix with six refusals that name no work (`decline`) as its hard cases about no task, and on three
+ * tasks a refusal right after the same person asked about the task (`declineAfter`).
+ */
+const STOPS: Partial<GenerateOptions> = { ...HARD, globalProbes: 6, globalKinds: ['decline'], contextDeclines: 3 }
 /** Saturation: the hard mix at nominally `perMin` cards per minute to the Router over 4 minutes, follow-ups trailing after it (requests, their cross-thread follow-ups and hard cases, small talk). */
 const saturating = (perMin: number): Partial<GenerateOptions> => {
   const cards = perMin * 4
@@ -204,6 +212,28 @@ const RELEASED: [string, (row: Summary) => string][] = [
   ['tokens in', r => r.model ? `${(r.model.promptTokens / 1000).toFixed(0)}k` : '—'],
 ]
 const MODELS = (process.env.ROUTER_MODELS ?? 'deepseek-flash,deepseek-v4-pro').split(',').map(name => name.trim()).filter(Boolean)
+
+/**
+ * One model row per dispatch text over `scenario`: the dispatch section as committed at DISPATCH_BEFORE (a git revision, default
+ * HEAD; '' skips it), then the texts in DISPATCH_FILES (comma-separated paths), else the working tree's.
+ */
+async function dispatchRows(scenario: Partial<GenerateOptions>): Promise<Summary[]> {
+  const { execFileSync } = await import('node:child_process')
+  const { readFile } = await import('node:fs/promises')
+  const revision = process.env.DISPATCH_BEFORE ?? 'HEAD'
+  const rows: Summary[] = []
+  if (revision) {
+    const before = execFileSync('git', ['show', `${revision}:prompts/dispatch.md`], { encoding: 'utf8' }).trimEnd()
+    rows.push(await pooled(`dispatch@${revision}`, scenario, { maxWorkers: 16 }, await model(undefined, { dispatch: before })))
+  }
+  const files = (process.env.DISPATCH_FILES ?? '').split(',').filter(Boolean)
+  for (const file of files) {
+    const text = (await readFile(file, 'utf8')).trimEnd()
+    rows.push(await pooled(`dispatch ${file.split('/').at(-1)}`, scenario, { maxWorkers: 16 }, await model(undefined, { dispatch: text })))
+  }
+  if (!files.length) rows.push(await pooled('dispatch (working tree)', scenario, { maxWorkers: 16 }, await model()))
+  return rows
+}
 
 const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: typeof SCHEDULING; probes?: boolean }>> = {
   baseline: async () => ({ rows: [await pooled('baseline', {}, {})], columns: SCHEDULING }),
@@ -247,20 +277,14 @@ const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: type
    * A dispatch prompt change: the hard cases with the dispatch section as committed at DISPATCH_BEFORE (a git revision, default
    * HEAD) against the working tree's, in one process (ROUTER_MODEL).
    */
-  'model-prompt': async () => {
-    const { execFileSync } = await import('node:child_process')
-    const revision = process.env.DISPATCH_BEFORE ?? 'HEAD'
-    const before = revision ? execFileSync('git', ['show', `${revision}:prompts/dispatch.md`], { encoding: 'utf8' }).trimEnd() : ''
-    // DISPATCH_FILES compares dispatch texts from files instead (comma-separated paths), each a row; DISPATCH_BEFORE='' skips the revision's row.
-    const { readFile } = await import('node:fs/promises')
-    const rows: Summary[] = []
-    if (revision) rows.push(await pooled(`dispatch@${revision}`, HARD, { maxWorkers: 16 }, await model(undefined, { dispatch: before })))
-    const files = (process.env.DISPATCH_FILES ?? '').split(',').filter(Boolean)
-    for (const file of files) {
-      const text = (await readFile(file, 'utf8')).trimEnd()
-      rows.push(await pooled(`dispatch ${file.split('/').at(-1)}`, HARD, { maxWorkers: 16 }, await model(undefined, { dispatch: text })))
-    }
-    if (!files.length) rows.push(await pooled('dispatch (working tree)', HARD, { maxWorkers: 16 }, await model()))
+  'model-prompt': async () => ({ rows: await dispatchRows(HARD), columns: JUDGEMENT, probes: true }),
+  /**
+   * Stop targets (#10): the hard mix with refusals instead of the other hard cases about no task, some right after the same
+   * person asked about a task, compared like model-prompt (DISPATCH_BEFORE, DISPATCH_FILES); ORACLE_ONLY=1 checks the scenario.
+   */
+  'model-stop': async () => {
+    const rows = [await pooled('oracle', STOPS, { maxWorkers: 16 })]
+    if (!process.env.ORACLE_ONLY) rows.push(...await dispatchRows(STOPS))
     return { rows, columns: JUDGEMENT, probes: true }
   },
   /** Released follow-ups: the Router with `released` cards and their dispatch rule, and without them (SKIP_BASELINE=1 skips that row). */
@@ -302,7 +326,7 @@ else {
     console.log('\n## Hard cases: right/total (outcomes)\n')
     const kinds = [...new Set(rows.flatMap(row => Object.keys(row.probes)))]
     const all = (row: Summary) => Object.values(row.probes).reduce((a, t) => [a[0]! + t.right, a[1]! + t.total], [0, 0])
-    table(rows, [['case', r => r.label], ['all', r => `${all(r)[0]}/${all(r)[1]}`], ...kinds.map(kind => [kind, (r: Summary) => {
+    table(rows, [['case', r => r.label], ['all', r => `${all(r)[0]}/${all(r)[1]}`], ['stops right/wrong', r => `${r.stops.right}/${r.stops.wrong}`], ...kinds.map(kind => [kind, (r: Summary) => {
       const t = r.probes[kind]
       if (!t) return '—'
       const wrong = Object.entries(t.outcomes).filter(([outcome]) => !PROBE_EXPECT[kind as keyof typeof PROBE_EXPECT].includes(outcome as never))

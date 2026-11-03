@@ -117,7 +117,14 @@ export const GLOBAL_PROBES: Record<GlobalProbe, string[]> = {
   /** A request a person puts on hold: no ticket until they lift it. */
   hold: ['@agent 先别动手，等我和产品确认完再说：支付页按钮改成绿色', '@agent 这个先记下，下周再做：把日志级别统一成 info'],
   /** A person declines the agent's help. */
-  decline: ['@agent 这个 bug 我自己来修，你不用管', '@agent 不用你弄了，bob 已经在改了'],
+  decline: ['@agent 这个 bug 我自己来修，你不用管', '@agent 不用你弄了，bob 已经在改了', '@agent 那个我来处理吧，你先别管了',
+    '@agent 算了，这个还是我自己弄', '@agent 你别忙了，组里已经有人接了', '@agent 不麻烦你了，我手上顺手就改了'],
   /** New work phrased indirectly: a ticket. */
   polite: ['@agent 有空的话能不能把日志里打印手机号的地方都脱敏一下？', '@agent 麻烦看下 staging 的健康检查为什么一直失败', '@agent 帮忙给 /api/health 加个数据库连通性检查'],
 }
+
+/**
+ * A refusal right after the same person asked about one task (its `status` probe): the context names the work, so stopping
+ * that ticket is right, and so is asking first (`declineAfter` in `scenario.ts`).
+ */
+export const DECLINE_AFTER = ['@agent 算了，这个我自己来改吧，你不用管了', '@agent 这个我顺手就改了，不用你弄了', '@agent 还是我来吧，你先别管这个了']
