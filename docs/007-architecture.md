@@ -444,6 +444,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/locales.spec.ts`, `tests/styles.spec.ts` | The copy in both languages, the stylesheet |
 | `tests/class-docs.spec.ts` | Every class in `src` has a JSDoc block before it |
 | `tests/docs.spec.ts` | Numbered documents link only to earlier ones, every local link resolves, no document has merge conflict markers, and this document's tables list every module and every test |
+| `tests/replay.spec.ts` | The replay simulator in `bench/replay/` drives the real Engine and Policy over a synthetic scenario without errors, acknowledges and completes every request, keeps thread follow-ups on the fast path, and is deterministic per seed |
 
 `tests/fixtures/` holds what several tests share: `host.ts`, a simulated DeepSeek Harness host; `panel-server.ts` and `panel.tsx`, the fake management API and the panel around a page; `deployment.ts`, a resolved deployment; `git.ts`, the environment of every git the tests start, which names no repository; and `async.ts`.
 

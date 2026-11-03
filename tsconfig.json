@@ -24,6 +24,7 @@
     "src/**/*.tsx",
     "tests/**/*.ts",
     "tests/**/*.tsx",
+    "bench/**/*.ts",
     "tsdown.config.ts"
   ]
 }
