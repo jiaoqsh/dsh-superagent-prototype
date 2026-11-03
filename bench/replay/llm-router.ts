@@ -5,18 +5,18 @@
  *
  * Differences from the product, each a simplification of the DSH host: one conversation with a fixed history cap instead of
  * DSH compaction; no DSH system prompt or skills; tools that change settings or prompts, or assess inferred candidates,
- * answer that they are unavailable; worker reports arrive as `worker_report` relays, and follow-up notices are not sent.
+ * answer that they are unavailable; worker reports arrive as `worker_report` relays, and follow_up notices only with `followupNotices`.
  */
 import { z } from 'zod'
 import type { Decision, Thread, Trigger } from '../../src/core/index.ts'
 import { TextCache } from '../../src/app/cache.ts'
 import { candidateCard } from '../../src/app/links.ts'
-import { resultRelay } from '../../src/app/notices.ts'
+import { followupNotice, resultRelay } from '../../src/app/notices.ts'
 import { composePrompt, defaultPrompts, policySection } from '../../src/app/prompts.ts'
 import { readResource } from '../../src/app/resources.ts'
 import { mainTools } from '../../src/app/tools/main.ts'
 import type { Tool } from '../../src/app/tools/tool.ts'
-import type { Job, Router, RouterWorld } from './sim.ts'
+import type { Job, Router, RouterStats, RouterWorld } from './sim.ts'
 
 export interface ModelConfig {
   baseUrl: string
@@ -24,6 +24,8 @@ export interface ModelConfig {
   model: string
   /** Messages kept after the system prompt; older exchanges are dropped whole. */
   historyMessages?: number
+  /** Seconds before an unanswered attempt is abandoned and retried (default 120). */
+  attemptTimeoutSec?: number
   /** Model calls allowed in one turn before it is cut off. */
   maxStepsPerTurn?: number
   /**
@@ -105,7 +107,7 @@ export function modelRouter(config: ModelConfig): Router {
       context: { logger }, engine: world.engine, store, prompts: unavailable('prompts'),
       sessions: { status: unavailable('sessions'), notify: unavailable('sessions'), delivery: unavailable('sessions'), modelRetry: () => ({}) },
       settings: unavailable('settings'), assessor: unavailable('assessor'), resources,
-      requestPass: () => world.pump(), sendReplies: async () => {}, quietly: <T>(run: () => T) => run(),
+      requestPass: () => world.pump(), sendReplies: async () => {}, quietly: <T>(run: () => T) => world.quietly(run),
     }
     tools = mainTools(host as never, {} as never)
     toolSpecs = tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description,
@@ -123,6 +125,7 @@ export function modelRouter(config: ModelConfig): Router {
   let linkHost: ReturnType<typeof setup> | undefined
 
   async function render(job: Job, world: RouterWorld): Promise<string | undefined> {
+    if (job.kind === 'followup') return followupNotice(linkHost!.store as never, linkHost!.sources as never, job.triggerId)?.text
     if (job.kind === 'relay') {
       const ticket = world.repo.tickets.get(job.ticketId)
       return ticket ? resultRelay(ticket, 'ready', job.summary).text : undefined
@@ -146,27 +149,38 @@ export function modelRouter(config: ModelConfig): Router {
     while (cut < messages!.length && messages![cut]!.role !== 'user') cut++
     messages = [messages![0]!, ...messages!.slice(cut)]
   }
-  async function complete(world: RouterWorld): Promise<Completion> {
+  /**
+   * One model call, retried on a dropped connection, a 429 or 5xx, an empty body, or an attempt that runs past
+   * `attemptTimeoutSec`; returns the completion and the wall time of the attempt that answered, which alone passes on the
+   * virtual clock, so an overloaded API's waits and retries do not stall the simulated team.
+   */
+  async function complete(world: RouterWorld, stats: NonNullable<RouterStats['model']>): Promise<{ completion: Completion; latency: number }> {
+    const timeout = (config.attemptTimeoutSec ?? 120) * 1000
     for (let attempt = 0; ; attempt++) {
+      const last = attempt >= 7
+      const retry = async () => { stats.retries = (stats.retries ?? 0) + 1; await new Promise(resolve => setTimeout(resolve, Math.min(60_000, 2000 * 2 ** attempt))) }
+      const started = performance.now()
       let response: Response
       let body: string
       try {
         response = await fetch(`${config.baseUrl.replace(/\/$/, '')}/chat/completions`, {
           method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
-          body: JSON.stringify({ model: config.model, messages, tools: toolSpecs, tool_choice: 'auto' }),
+          body: JSON.stringify({ model: config.model, messages, tools: toolSpecs, tool_choice: 'auto' }), signal: AbortSignal.timeout(timeout),
         })
         // The body is read inside the retry too: a connection can drop while it streams.
         body = await response.text()
-        if (response.ok) return JSON.parse(body) as Completion
       } catch (error) {
-        // A dropped connection is retried like a 5xx; DSH retries model calls the same way.
-        if (attempt < 5) { await new Promise(resolve => setTimeout(resolve, 2000 * 2 ** attempt)); continue }
+        // A dropped connection or a timed-out attempt is retried like a 5xx; DSH retries model calls the same way.
+        if (!last) { await retry(); continue }
         throw error
       }
-      if (attempt < 5 && (response.status === 429 || response.status >= 500)) {
-        await new Promise(resolve => setTimeout(resolve, 2000 * 2 ** attempt))
-        continue
+      if (response.ok) {
+        const completion = (() => { try { return JSON.parse(body) as Completion | null } catch { return null } })()
+        if (completion?.choices?.length) return { completion, latency: (performance.now() - started) / 1000 }
+        if (!last) { await retry(); continue }
+        throw new Error(`model API answered no choices at ${world.now().toFixed(0)}s: ${body.slice(0, 300)}`)
       }
+      if (!last && (response.status === 429 || response.status >= 500)) { await retry(); continue }
       throw new Error(`model API ${response.status} at ${world.now().toFixed(0)}s: ${body.slice(0, 300)}`)
     }
   }
@@ -191,9 +205,7 @@ export function modelRouter(config: ModelConfig): Router {
       if (!fresh) return
       for (let step = 0; step < maxSteps; step++) {
         trim()
-        const started = performance.now()
-        const completion = await complete(world)
-        const latency = (performance.now() - started) / 1000
+        const { completion, latency } = await complete(world, stats)
         stats.calls++
         stats.latencySec.push(latency)
         stats.promptTokens += completion.usage?.prompt_tokens ?? 0
