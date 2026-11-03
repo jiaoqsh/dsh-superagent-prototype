@@ -1,4 +1,4 @@
-import { ADDRESSED_NOISE, GLOBAL_PROBES, NOISE, TASKS, type GlobalProbe, type TaskProbe } from './corpus.ts'
+import { ADDRESSED_NOISE, DECLINE_AFTER, GLOBAL_PROBES, NOISE, TASKS, type GlobalProbe, type TaskProbe } from './corpus.ts'
 
 /**
  * Replay scenarios: a timed message stream with a ground-truth label per message, so a run can be scored.
@@ -18,11 +18,14 @@ export type Truth =
   /** A CI result on the task's thread; `extraSec` > 0 is a failure the worker must fix. */
   | { kind: 'ci'; task: string; extraSec: number }
   /** A hard case (`corpus.ts`): `expect` lists the outcomes a correct Router may reach; `task` is the task it is about, if any. */
-  | { kind: 'probe'; probe: TaskProbe | GlobalProbe; task?: string; expect: ProbeOutcome[]; extraSec: number }
+  | { kind: 'probe'; probe: ProbeKind; task?: string; expect: ProbeOutcome[]; extraSec: number }
+
+/** A hard case: about a task, about none, or a refusal whose task only the context names (`DECLINE_AFTER`). */
+export type ProbeKind = TaskProbe | GlobalProbe | 'declineAfter'
 
 /** How a message ended: a new ticket, attached to its task's ticket, its task's ticket stopped, or no ticket at all. */
 export type ProbeOutcome = 'accept' | 'attach' | 'stop' | 'ignore'
-export const PROBE_EXPECT: Record<TaskProbe | GlobalProbe, ProbeOutcome[]> = {
+export const PROBE_EXPECT: Record<ProbeKind, ProbeOutcome[]> = {
   stop: ['stop'],
   // Answering is enough; attaching wakes the worker to answer, also right.
   status: ['ignore', 'attach'],
@@ -31,6 +34,8 @@ export const PROBE_EXPECT: Record<TaskProbe | GlobalProbe, ProbeOutcome[]> = {
   duplicate: ['ignore', 'attach'],
   similarNew: ['accept'],
   vague: ['ignore'], question: ['ignore'], hold: ['ignore'], decline: ['ignore'], polite: ['accept'],
+  // The person just asked about that task: stopping it is right, asking which work they mean is too.
+  declineAfter: ['stop', 'ignore'],
 }
 
 /**
@@ -73,6 +78,13 @@ export interface GenerateOptions {
   probesPerRequest: number
   /** Hard cases about no task (`GlobalProbe`, in rotation), after the first fifth of the window. */
   globalProbes: number
+  /** Kinds the hard cases about no task rotate through; default all. */
+  globalKinds?: GlobalProbe[]
+  /**
+   * Refusals with context (`declineAfter`): on up to this many tasks without a stop, the person who asked about the task's
+   * status (its `status` probe, added when it has none) declines 45 s later without naming it; later follow-ups come before.
+   */
+  contextDeclines?: number
   /** Indices into `TASKS` in the order requests use them; default in order. */
   taskOrder?: number[]
 }
@@ -104,6 +116,7 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
   const members = ['alice', 'bob', 'carol']
   const guests = ['dave', 'erin']
   const events: Omit<ScenarioEvent, 'id'>[] = []
+  let declined = 0
   for (let i = 0; i < o.requests; i++) {
     const task = `task-${i}`
     const thread = `oc_team:om_req${i}`
@@ -115,13 +128,23 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
     events.push({ at, thread, actor, human: true, addressed: true, text: text.request, truth: { kind: 'request', task, workSec } })
     const kinds = Array.from({ length: o.probesPerRequest }, (_, j) => TASK_PROBES[(i + j) % TASK_PROBES.length]!)
     // A stop comes last, so the task's other messages find it open.
-    const stopAt = kinds.includes('stop') ? at + Math.round(workSec * 0.9) : Infinity
-    for (const probe of kinds) {
-      const when = probe === 'stop' ? stopAt : at + Math.round(90 + random() * workSec * 0.6)
+    let stopAt = kinds.includes('stop') ? at + Math.round(workSec * 0.9) : Infinity
+    const probe = (probe: TaskProbe, when: number, by: string) => events.push({ at: when, thread: `oc_team:om_probe${i}-${probe}`, actor: by,
+      human: true, addressed: true, text: text.probes[probe], truth: { kind: 'probe', probe, task, expect: PROBE_EXPECT[probe], extraSec: between(o.extraSec) } })
+    let status: { when: number; by: string } | undefined
+    for (const kind of kinds) {
+      const when = kind === 'stop' ? stopAt : at + Math.round(90 + random() * workSec * 0.6)
       // A duplicate usually comes from someone who missed the first request.
-      const by = probe === 'duplicate' ? pick(members.filter(member => member !== actor)) : pick(members)
-      events.push({ at: when, thread: `oc_team:om_probe${i}-${probe}`, actor: by, human: true, addressed: true, text: text.probes[probe],
-        truth: { kind: 'probe', probe, task, expect: PROBE_EXPECT[probe], extraSec: between(o.extraSec) } })
+      const by = kind === 'duplicate' ? pick(members.filter(member => member !== actor)) : pick(members)
+      probe(kind, when, by)
+      if (kind === 'status') status = { when, by }
+    }
+    if (stopAt === Infinity && declined < (o.contextDeclines ?? 0)) {
+      if (!status) { status = { when: at + Math.round(workSec * 0.6), by: pick(members) }; probe('status', status.when, status.by) }
+      stopAt = status.when + 45
+      events.push({ at: stopAt, thread: `oc_team:om_probe${i}-declineAfter`, actor: status.by, human: true, addressed: true,
+        text: DECLINE_AFTER[declined % DECLINE_AFTER.length]!, truth: { kind: 'probe', probe: 'declineAfter', task, expect: PROBE_EXPECT.declineAfter, extraSec: 0 } })
+      declined++
     }
     // Each follow-up text once per task: the j-th of a kind takes text j where it is free, else the first free one, else
     // the follow-up becomes the other kind, so no task repeats a message word for word.
@@ -171,7 +194,7 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
     events.push({ at: Math.round(random() * o.durationSec * 1.3), thread: `oc_team:om_hi${i}`, actor: pick(members), human: true, addressed: true,
       text: ADDRESSED_NOISE[i % ADDRESSED_NOISE.length]!, truth: { kind: 'noise' } })
   }
-  const globals = Object.keys(GLOBAL_PROBES) as GlobalProbe[]
+  const globals = o.globalKinds ?? Object.keys(GLOBAL_PROBES) as GlobalProbe[]
   for (let i = 0; i < o.globalProbes; i++) {
     const probe = globals[i % globals.length]!
     const texts = GLOBAL_PROBES[probe]

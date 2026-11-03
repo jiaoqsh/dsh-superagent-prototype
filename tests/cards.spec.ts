@@ -13,6 +13,9 @@ import { key, said, type Decision, type Thread, type Ticket, type Trigger } from
 const RULES: [rule: string, file: string, says: string[], gone?: string[]][] = [
   ['A message attaches to a ticket only on an explicit pointer', 'dispatch',
     ['Attach only when the message points at that ticket explicitly', 'A message on a similar subject is a new request: accept or ignore it, never attach it.']],
+  ['A stop needs the same explicit pointer; a refusal that names no work stops nothing', 'dispatch',
+    ['Stop only a ticket the message points at the same way', 'a refusal or a stop that names no work, such as “你不用管”, stops nothing',
+      'never take the ticket from the sender\'s open tickets or requests']],
   ['An Executor drops an attached thread it finds unrelated, without replying there', 'work',
     ['call orchestrator_thread_unrelated with the thread key and a one-sentence reason; do not acknowledge it or reply there.']],
   ['A located element or a few CSS lines settle no design', 'team/scope',

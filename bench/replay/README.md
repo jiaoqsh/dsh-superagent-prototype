@@ -21,6 +21,7 @@ Options: `--runs N` (seeds per row, default 10), `--json`, `--out file.json` (ro
 | `model-saturation` | model | The hard mix at rising rates (nominal 20/60/120 per minute, `SAT_RATES`). Confounded at high rates: tasks repeat and short tickets end early (released inputs come back to Eval), so use `model-batch` for D2 |
 | `model-released` | oracle, model, model + fix | Follow-ups a ticket lets go unread when it ends (`Tickets.letGo`): how many the Router recovers with `released` on cards and its dispatch rule, and without them (`released: false` in `llm-router.ts`; `SKIP_BASELINE=1` skips that row). `WORKER_STEP` sets how long a worker takes to read new input (default 60 s) |
 | `model-prompt` | model per dispatch text | A dispatch prompt change: the dispatch section at `DISPATCH_BEFORE` (a git revision, default `HEAD`) against the working tree's, or the texts in `DISPATCH_FILES` (comma-separated paths), one row each, over the hard cases |
+| `model-stop` | oracle, then model per dispatch text | Stop targets (#10): the hard mix with refusals that name no work, and refusals right after the same person asked about a task; compared like `model-prompt`. The `stops right/wrong` column counts every stop the Router decided, wrong ones being stops of a ticket nobody asked to stop |
 | `model-batch` | oracle and model per size | D2, controlled: a fixed hard mix (no repeated task, tickets open throughout) with the Router held until `minBatch` cards wait (1/5/10/20, `BATCH_SIZES`); judgement only, the hold inflates acknowledgement times |
 
 Model experiments read `DEEPSEEK_API_KEY` from the environment or `.env`; `ROUTER_BASE_URL` (default
@@ -68,6 +69,7 @@ with the outcomes a correct Router may reach (`PROBE_EXPECT` in `scenario.ts`), 
 | vague | “刚才那个也顺便处理一下吧” with several tickets open | ask (ignore), not guess |
 | question / hold / decline | a question, “先别动手，等我确认”, “你不用管” | no ticket |
 | polite | “有空的话能不能把日志里的手机号脱敏一下？” | a new ticket |
+| declineAfter | “算了，这个我自己来改吧，你不用管了”, 45 s after the same person asked how a task is going | stop that ticket, or ask (ignore) |
 
 Tasks 12 and 13 are siblings of tasks 0 and 1 (same page or feature, another problem); `HARD_ORDER` starts them together, so a
 cross-thread follow-up must be read for which ticket it means (`cross … wrong`).

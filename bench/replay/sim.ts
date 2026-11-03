@@ -157,6 +157,11 @@ export interface Score {
   released: { total: number; reachedRouter: number; rescued: number; lostAtRouter: number; lostAtGate: number }
   /** Hard cases by kind: how many, how many reached the Router, how many ended as expected, and each outcome's count. */
   probes: Record<string, { total: number; reachedRouter: number; right: number; outcomes: Record<string, number> }>
+  /**
+   * Stops the Router decided: of the ticket a hard case asked to stop (`expect` has stop), or of any other ticket (a guess;
+   * it ends work someone wanted, and a person's stop keeps the ticket from resuming).
+   */
+  stops: { right: number; wrong: number }
   /** Per message that reached the Router: what it was and what the Router did with it, for error analysis. */
   routed: { triggerId: string; truth: Truth['kind']; outcome: string; reason?: string; text: string }[]
 }
@@ -478,7 +483,7 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
   const s: Score = {
     requests: { total: 0, accepted: 0, missed: 0, reachedRouter: 0 }, falseTickets: 0, noise: { reachedRouter: 0, accepted: 0 },
     cross: { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0 }, followups: { total: 0, fast: 0 },
-    probes: {}, routed: [], released: { total: 0, reachedRouter: 0, rescued: 0, lostAtRouter: 0, lostAtGate: 0 },
+    probes: {}, stops: { right: 0, wrong: 0 }, routed: [], released: { total: 0, reachedRouter: 0, rescued: 0, lostAtRouter: 0, lostAtGate: 0 },
   }
   const decisionOf = (id: string) => {
     const decisionId = repo.triggers.disposition(id)?.decisionId
@@ -498,6 +503,10 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
     const outcome = decision?.kind === 'accept' ? `accept → ${decision.ticketId}` : fanout.length ? `reached ${fanout.join(',')}` : decision?.kind ?? 'none'
     const reason = decision ? reasonText(decision.reason) : undefined
     if (reached) s.routed.push({ triggerId: event.id, truth: label.kind, outcome, ...reason ? { reason } : {}, text: event.text })
+    if (decision?.kind === 'stop') {
+      const asked = label.kind === 'probe' && label.expect.includes('stop') && label.task && decision.ticketId === taskTicket.get(label.task)
+      s.stops[asked ? 'right' : 'wrong']++
+    }
     if (label.kind === 'request') {
       s.requests.total++
       if (reached) s.requests.reachedRouter++
