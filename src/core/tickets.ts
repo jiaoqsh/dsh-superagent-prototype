@@ -289,7 +289,8 @@ export class Tickets extends EnginePart {
    * A ticket that ended, or cannot resume, lets go of the messages its worker never received, `waiting`, and of the person's
    * messages it decided but may not have taken up, `left`: it no longer counts as having reached them, and each of `left`
    * that no other ticket decides goes to Eval, as a person's message that reached no ticket does, unless a ticket took it
-   * up, a Decision settled it, or it is the message a stop ended this ticket on.
+   * up, a Decision settled it, or it is the message a stop ended this ticket on; the Disposition records that this ticket
+   * released it.
    */
   private letGo(ticketId: string, waiting: readonly Trigger[], left: readonly Trigger[]): void {
     for (const trigger of [...waiting, ...left]) {
@@ -304,7 +305,12 @@ export class Tickets extends EnginePart {
       // The main Session that stopped this ticket on the message decides the rest of it itself, unless a ticket handed it back.
       const stopped = decision?.kind === 'stop' && decision.ticketId === ticketId && !disposition?.handbacks?.length
       const decided = !!decision && (settled(decision) || stopped)
-      if (!this.owners(trigger).length && !disposition?.acked?.length && !decided) this.queueForEval(trigger)
+      if (this.owners(trigger).length || disposition?.acked?.length || decided) continue
+      // Recorded before it is queued, so its candidate card can say that a ticket let it go unread rather than delivered it.
+      const current = this.repo.triggers.disposition(trigger.id) ?? { fanout: [], at: this.now() }
+      const released = [...(current.released ?? []).filter(item => item.ticketId !== ticketId), { ticketId, at: this.now() }]
+      this.repo.triggers.saveDisposition(trigger.id, { ...current, released })
+      this.queueForEval(trigger)
     }
   }
   /** An ended ticket that cannot resume takes none of the messages that waited for it (see `letGo`). */

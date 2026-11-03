@@ -557,6 +557,19 @@ describe('follow-up owners', () => {
       expect(h.repo.tickets.get(ticketId)!.ended).toMatchObject({ outcome: 'merged' })
     }
   })
+  it('records that an ended ticket released a person\'s message its worker never took up, and not one it took up', () => {
+    for (const taken of [false, true]) {
+      const h = harness()
+      const ticketId = accepted(h).ticketId!
+      h.engine.report(ticketId, { state: 'progress', summary: 'working' })
+      h.tick(1); h.engine.receive(trigger('2')); h.settle()
+      if (taken) h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'On it' })
+      h.engine.report(ticketId, { state: 'dropped', summary: 'nothing to do' })
+      // One it let go goes to Eval with the ticket that released it, so the main Session does not take it for a duplicate.
+      expect(h.repo.triggers.disposition('2')!.released).toEqual(taken ? undefined : [{ ticketId, at: expect.any(String) }])
+      expect(h.repo.threads.get('chat:t1')!.pending).toEqual(taken ? [] : ['2'])
+    }
+  })
   it('gives a follow-up its ended ticket let go to that ticket again when the main Session attaches it there', () => {
     for (const resumed of [false, true]) {
       const h = harness()

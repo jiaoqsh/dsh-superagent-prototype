@@ -187,6 +187,22 @@ it('takes the message a follow-up answers from its Source kind, whichever kind i
   expect(repliedTo(h.runtime, followup('3', 'yes', { parent_id: 'om_1' }))).toEqual(parent)
 })
 
+it('marks a follow-up an ended ticket let go unread as released on its candidate card', async () => {
+  h = await startRuntime()
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))
+  const message = followup('2', '顺便把标题也改了')
+  h.runtime.receive(message); await h.runtime.idle()
+  // The worker ends the ticket before it took the message up, so the ticket lets it go to Eval.
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'dropped', summary: 'nothing to do' })
+  await h.runtime.pump(); await h.runtime.idle()
+  expect(h.runtime.store.triggers.disposition(message.id)!.released).toEqual([{ ticketId: ticket.id, at: expect.any(String) }])
+  expect(h.relays(h.runtime.masterId).find(item => item.kind === 'candidate' && item.trigger_id === message.id)).toMatchObject({
+    released: [{ trigger_id: message.id, ticket: expect.objectContaining({ ticket_id: ticket.id }) }] })
+  // Attached there again, it resumes the ticket.
+  await h.route({ kind: 'attach', ticket_id: ticket.id, trigger_id: message.id }); await h.runtime.idle()
+  expect(h.runtime.store.tickets.get(ticket.id)!.ended).toBeUndefined()
+})
+
 it('tells the main Session of a follow-up to an ended ticket once the ticket resumes, and not when it cannot', async () => {
   h = await startRuntime()
   const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot 修一下回归'))

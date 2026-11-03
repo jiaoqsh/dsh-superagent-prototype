@@ -15,7 +15,6 @@ import { resultRelay } from '../../src/app/notices.ts'
 import { composePrompt, defaultPrompts, policySection } from '../../src/app/prompts.ts'
 import { readResource } from '../../src/app/resources.ts'
 import { mainTools } from '../../src/app/tools/main.ts'
-import { ticketCard } from '../../src/app/cards.ts'
 import type { Tool } from '../../src/app/tools/tool.ts'
 import type { Job, Router, RouterWorld } from './sim.ts'
 
@@ -28,10 +27,10 @@ export interface ModelConfig {
   /** Model calls allowed in one turn before it is cut off. */
   maxStepsPerTurn?: number
   /**
-   * Candidate fix under test: a card marks a message a ticket let go unread when it ended (`released`, with that ticket),
-   * and dispatch says such a message is not a duplicate delivery. Off = the product as it is.
+   * Off: the Router as it was before `released`: cards do not mark a message a ticket let go unread when it ended, and
+   * dispatch has no rule for it. Default on, as the product is.
    */
-  releasedFix?: boolean
+  released?: boolean
   /** Called with each model step, for logging. */
   onStep?: (step: { atSec: number; latencySec: number; jobs: number; toolCalls: string[]; text?: string }) => void
 }
@@ -58,23 +57,6 @@ export async function loadEnv(path = new URL('../../.env', import.meta.url)): Pr
     const match = /^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/.exec(line)
     if (match && process.env[match[1]!] === undefined) process.env[match[1]!] = match[2]!.replace(/^(['"])(.*)\1$/, '$2')
   }
-}
-
-/** The dispatch rule that goes with `released` cards. */
-export const RELEASED_RULE = 'released: a ticket ended before its worker read this message, so the ticket let it go and it came back here; '
-  + 'it is not a duplicate delivery, and no worker has acted on it. Route it as new: attach it to that ticket again when it '
-  + 'is still that ticket\'s (an ended ticket resumes), or route it as any other message.'
-
-/** The tickets that let each of `triggers` go unread: it is one of their Inputs but no longer reaches them, and was not handed back. */
-function releasedOf(world: RouterWorld, triggers: readonly Trigger[]) {
-  const released = triggers.flatMap(trigger => {
-    const disposition = world.repo.triggers.disposition(trigger.id)
-    return world.repo.tickets.list()
-      .filter(ticket => ticket.inputs.some(input => input.kind === 'trigger' && input.triggerId === trigger.id)
-        && !disposition?.fanout.includes(ticket.id) && !disposition?.handbacks?.some(item => item.ticketId === ticket.id))
-      .map(ticket => ({ trigger_id: trigger.id, ticket: ticketCard(ticket) }))
-  })
-  return released.length ? { released } : {}
 }
 
 export function modelRouter(config: ModelConfig): Router {
@@ -127,8 +109,10 @@ export function modelRouter(config: ModelConfig): Router {
     toolSpecs = tools.map(tool => ({ type: 'function', function: { name: tool.name, description: tool.description,
       parameters: z.toJSONSchema(tool.schema, { io: 'input', unrepresentable: 'any' }) } }))
     const linkHost = { store, links: new TextCache(1_000_000), commands: unavailable('commands'), sources, lifetime: new AbortController().signal }
-    const system = composePrompt(defaultPrompts(), 'orchestrator', undefined, policySection(settings))
-      + (config.releasedFix ? `\n\n${RELEASED_RULE}` : '')
+    const composed = composePrompt(defaultPrompts(), 'orchestrator', undefined, policySection(settings))
+    // Without `released`, the dispatch rule for it goes too (the composed prompt joins dispatch.md's lines with spaces).
+    const system = config.released === false ? composed.replace(/ ?released: a ticket ended before[^]*?as any other message\./, '') : composed
+    if (config.released === false && system === composed) throw new Error('the released rule was not found in the prompt')
     messages = [{ role: 'system', content: system }]
     return linkHost
   }
@@ -142,8 +126,8 @@ export function modelRouter(config: ModelConfig): Router {
     // A card shows the Eval as it stands when it reaches the Session, as `MasterAssessor` builds it at delivery.
     const live = world.engine.candidate(job.candidate.triggers[0]!.id)
     if (!live || live.evalId !== job.candidate.evalId) return undefined
-    const card = await candidateCard(linkHost as never, live)
-    return JSON.stringify({ kind: 'candidate', ...card, ...config.releasedFix ? releasedOf(world, live.triggers) : {} })
+    const { released, ...card } = await candidateCard(linkHost as never, live)
+    return JSON.stringify({ kind: 'candidate', ...card, ...config.released === false || !released ? {} : { released } })
   }
   async function deliver(jobs: Job[], world: RouterWorld): Promise<number> {
     const texts = (await Promise.all(jobs.map(job => render(job, world)))).filter((text): text is string => !!text)

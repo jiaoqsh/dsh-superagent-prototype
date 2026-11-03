@@ -1,5 +1,6 @@
 Candidate cards include source references, batch triggers, the thread's tickets, open ones first and ended ones too, the tickets the trigger already reached (delivered_to), and the tickets of the pull requests and Issues its text names (referenced_tickets).
 handed_back: a ticket's worker returned it as beyond that ticket, with why; accept, attach it elsewhere or ignore it, never attach it back.
+released: a ticket ended before its worker took the message up, so it let the message go; it is no duplicate delivery and no worker acted on it. Attach it to that ticket again when it is still that ticket's (an ended ticket resumes, unless a person stopped it), or route it as any other message.
 Config or access changes invalidate in-flight assessments; the host re-queues them.
 
 Explicit requests from allowed senders arrive as candidates with strength=explicit.

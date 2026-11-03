@@ -148,7 +148,7 @@ const JUDGEMENT: [string, (row: Summary) => string][] = [
   ['tokens in(cached)/out', r => r.model ? `${(r.model.promptTokens / 1000).toFixed(0)}k(${(r.model.cachedTokens / 1000).toFixed(0)}k)/${(r.model.completionTokens / 1000).toFixed(1)}k` : '—'],
 ]
 
-async function model(name = process.env.ROUTER_MODEL ?? 'deepseek-flash', extra: { releasedFix?: boolean } = {}): Promise<() => Router> {
+async function model(name = process.env.ROUTER_MODEL ?? 'deepseek-flash', extra: { released?: boolean } = {}): Promise<() => Router> {
   await loadEnv()
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error('DEEPSEEK_API_KEY is not set (put it in .env)')
@@ -243,13 +243,13 @@ const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: type
     return { rows: await sequence((process.env.SAT_RATES ?? '20,60,120').split(',').map(Number), perMin => pooled(`${perMin}/min`, saturating(perMin), { maxWorkers: 16 }, router)),
       columns: [...JUDGEMENT.slice(0, 1), ['arrivals/min', r => r.cardsPerMin.toFixed(0)], ...JUDGEMENT.slice(1)], probes: true }
   },
-  /** Released follow-ups: the product as it is against the candidate fix (`released` on cards plus a dispatch rule). */
+  /** Released follow-ups: the Router with `released` cards and their dispatch rule, and without them (SKIP_BASELINE=1 skips that row). */
   'model-released': async () => {
     const SIM = { maxWorkers: 16, workerStepSec: Number(process.env.WORKER_STEP ?? 60) }
     const rows = [await pooled('oracle', RELEASE, SIM)]
     if (process.env.ORACLE_ONLY) return { rows, columns: RELEASED }
+    if (!process.env.SKIP_BASELINE) rows.push(await pooled('model without released', RELEASE, SIM, await model(undefined, { released: false })))
     rows.push(await pooled('model', RELEASE, SIM, await model()))
-    rows.push(await pooled('model + released fix', RELEASE, SIM, await model(undefined, { releasedFix: true })))
     return { rows, columns: RELEASED }
   },
   /** D2, controlled: the same hard mix, the Router held until `minBatch` cards wait (ROUTER_MODEL). */
