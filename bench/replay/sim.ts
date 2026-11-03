@@ -150,6 +150,11 @@ export interface Score {
   cross: { total: number; reachedRouter: number; attachedRight: number; attachedWrong: number; acceptedAsNew: number; lost: number }
   /** Same-thread follow-ups, and those that reached their task's ticket (by subscription, or in the accepted batch). */
   followups: { total: number; fast: number }
+  /**
+   * Follow-ups a ticket let go unread when it ended (`Tickets.letGo`), so they went back to Eval: how many, how many then
+   * reached the Router, and how many ended on their task's ticket after all.
+   */
+  released: { total: number; reachedRouter: number; rescued: number; lostAtRouter: number; lostAtGate: number }
   /** Hard cases by kind: how many, how many reached the Router, how many ended as expected, and each outcome's count. */
   probes: Record<string, { total: number; reachedRouter: number; right: number; outcomes: Record<string, number> }>
   /** Per message that reached the Router: what it was and what the Router did with it, for error analysis. */
@@ -203,6 +208,11 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   const ticketTask = new Map<string, string>()
   /** Triggers whose card reached the Router. */
   const routed = new Set<string>()
+  /** Triggers a ticket let go unread (an Input of a ticket they no longer reach), and those of them whose card then reached the Router. */
+  const released = new Set<string>()
+  const releasedRouted = new Set<string>()
+  const wasLetGo = (triggerId: string) => repo.tickets.list().some(ticket => ticket.inputs.some(input => input.kind === 'trigger'
+    && input.triggerId === triggerId) && !repo.triggers.disposition(triggerId)?.fanout.includes(ticket.id))
   const received: Trigger[] = []
   const decisionIds: string[] = []
 
@@ -233,6 +243,7 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   let turnDue = false
   const assessor: EngineOptions['assessor'] = {
     request: candidate => {
+      for (const trigger of candidate.triggers) if (wasLetGo(trigger.id)) released.add(trigger.id)
       if (seenEvals.has(candidate.evalId)) return
       seenEvals.add(candidate.evalId)
       result.evals++
@@ -270,7 +281,10 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
       stats.items += delivered.length
       for (const job of delivered) {
         if (job.kind !== 'candidate') continue
-        for (const trigger of job.candidate.triggers) routed.add(trigger.id)
+        for (const trigger of job.candidate.triggers) {
+          routed.add(trigger.id)
+          if (released.has(trigger.id)) releasedRouted.add(trigger.id)
+        }
         guard(() => engine.candidateDelivered(job.candidate.evalId))
       }
     },
@@ -388,6 +402,7 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
       result.decisions[event.data.kind] = (result.decisions[event.data.kind] ?? 0) + 1
       decisionIds.push(event.data.decisionId)
       const decision = repo.decisions.get(event.data.decisionId)
+      for (const id of decision?.triggerIds ?? []) if (wasLetGo(id)) released.add(id)
       // An ignore whose Eval never reached the Router is the gate's (program layer) refusal.
       if (decision?.kind === 'ignore' && !seenEvals.has(decision.evalId)) result.gateRejected += decision.triggerIds.length
     }
@@ -452,17 +467,18 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   result.endSec = now
   result.requests = [...requests.values()]
   result.followups = [...followups.values()]
-  result.score = score(scenario, repo, routed, taskTicket)
+  result.score = score(scenario, repo, routed, taskTicket, released, releasedRouted)
   Object.defineProperty(result, 'repo', { value: repo, enumerable: false })
   return result
 }
 
 /** Reads how every labelled message ended from the records, whatever Router decided it. */
-export function score(scenario: Scenario, repo: MemoryRepositories, routed: ReadonlySet<string>, taskTicket: ReadonlyMap<string, string>): Score {
+export function score(scenario: Scenario, repo: MemoryRepositories, routed: ReadonlySet<string>, taskTicket: ReadonlyMap<string, string>,
+  released: ReadonlySet<string> = new Set(), releasedRouted: ReadonlySet<string> = new Set()): Score {
   const s: Score = {
     requests: { total: 0, accepted: 0, missed: 0, reachedRouter: 0 }, falseTickets: 0, noise: { reachedRouter: 0, accepted: 0 },
     cross: { total: 0, reachedRouter: 0, attachedRight: 0, attachedWrong: 0, acceptedAsNew: 0, lost: 0 }, followups: { total: 0, fast: 0 },
-    probes: {}, routed: [],
+    probes: {}, routed: [], released: { total: 0, reachedRouter: 0, rescued: 0, lostAtRouter: 0, lostAtGate: 0 },
   }
   const decisionOf = (id: string) => {
     const decisionId = repo.triggers.disposition(id)?.decisionId
@@ -474,7 +490,9 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
   for (const event of scenario.events) {
     const disposition = repo.triggers.disposition(event.id)
     const decision = decisionOf(event.id)
-    const fanout = disposition?.fanout ?? []
+    // The tickets it reached: those it still reaches, and those whose worker took it up (acknowledged it), since a ticket
+    // that ended lets go of the messages it holds even when its worker read them.
+    const fanout = [...new Set([...disposition?.fanout ?? [], ...disposition?.acked ?? []])]
     const label = event.truth
     const reached = routed.has(event.id)
     const outcome = decision?.kind === 'accept' ? `accept → ${decision.ticketId}` : fanout.length ? `reached ${fanout.join(',')}` : decision?.kind ?? 'none'
@@ -521,5 +539,17 @@ export function score(scenario: Scenario, repo: MemoryRepositories, routed: Read
     }
   }
   for (const ticket of repo.tickets.list()) if (!requestTickets.has(ticket.id) && !probeTickets.has(ticket.id)) s.falseTickets++
+  for (const event of scenario.events) {
+    const label = event.truth
+    if (!released.has(event.id) || (label.kind !== 'cross' && label.kind !== 'followup')) continue
+    s.released.total++
+    const right = taskTicket.get(label.task)
+    const reached = releasedRouted.has(event.id)
+    if (reached) s.released.reachedRouter++
+    const disposition = repo.triggers.disposition(event.id)
+    if (right && (disposition?.fanout.includes(right) || disposition?.acked?.includes(right))) s.released.rescued++
+    else if (reached) s.released.lostAtRouter++
+    else s.released.lostAtGate++
+  }
   return s
 }

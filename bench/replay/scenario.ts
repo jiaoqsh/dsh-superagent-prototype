@@ -123,15 +123,37 @@ export function generate(options: Partial<GenerateOptions> = {}): Scenario {
       events.push({ at: when, thread: `oc_team:om_probe${i}-${probe}`, actor: by, human: true, addressed: true, text: text.probes[probe],
         truth: { kind: 'probe', probe, task, expect: PROBE_EXPECT[probe], extraSec: between(o.extraSec) } })
     }
+    // Each follow-up text once per task: the j-th of a kind takes text j where it is free, else the first free one, else
+    // the follow-up becomes the other kind, so no task repeats a message word for word.
+    const used = { cross: new Set<number>(), followup: new Set<number>() }
+    const textOf = (kind: 'cross' | 'followup', j: number) => {
+      const list = kind === 'cross' ? text.cross : text.followups
+      const free = (n: number) => !used[kind].has(n)
+      const index = free(j % list.length) ? j % list.length : list.findIndex((_, n) => free(n))
+      if (index < 0) return undefined
+      used[kind].add(index)
+      return list[index]!
+    }
     for (let j = 0; j < o.followupsPerRequest; j++) {
       const later = Math.min(stopAt - 60, at + Math.round(60 + random() * workSec * 1.2))
       const extraSec = between(o.extraSec)
-      if (random() < o.crossFraction) {
-        const addressed = random() < o.crossAddressed
+      const crossWanted = random() < o.crossFraction
+      let addressed = crossWanted && random() < o.crossAddressed
+      const first = crossWanted ? 'cross' : 'followup'
+      const second = crossWanted ? 'followup' : 'cross'
+      let kind: 'cross' | 'followup' = first
+      let body = textOf(first, j)
+      if (body === undefined) {
+        kind = second
+        body = textOf(second, j)
+        if (kind === 'cross') addressed = random() < o.crossAddressed
+      }
+      if (body === undefined) continue
+      if (kind === 'cross') {
         events.push({ at: later, thread: `oc_team:om_cross${i}-${j}`, actor: pick(members), human: true, addressed,
-          text: `${addressed ? '@agent ' : ''}${text.cross[j % text.cross.length]!}`, truth: { kind: 'cross', task, extraSec } })
+          text: `${addressed ? '@agent ' : ''}${body}`, truth: { kind: 'cross', task, extraSec } })
       } else {
-        events.push({ at: later, thread, actor: pick(members), human: true, addressed: false, text: text.followups[j % text.followups.length]!,
+        events.push({ at: later, thread, actor: pick(members), human: true, addressed: false, text: body,
           truth: { kind: 'followup', task, extraSec } })
       }
     }

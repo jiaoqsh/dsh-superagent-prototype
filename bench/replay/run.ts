@@ -39,6 +39,7 @@ export interface Summary {
   probes: Record<string, { total: number; reachedRouter: number; right: number; outcomes: Record<string, number> }>
   /** Addressed messages per minute within the generation window: the peak rate offered to the Router. */
   cardsPerMin: number
+  released: SimResult['score']['released']
   model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencyP50: number; latencyP95: number; toolCalls: Record<string, number> }
   errors: string[]
 }
@@ -56,8 +57,10 @@ export function summarize(label: string, results: (SimResult & { window?: number
     into.total += tally.total; into.reachedRouter += tally.reachedRouter; into.right += tally.right
     for (const [outcome, n] of Object.entries(tally.outcomes)) into.outcomes[outcome] = (into.outcomes[outcome] ?? 0) + n
   }
+  const released = { total: 0, reachedRouter: 0, rescued: 0, lostAtRouter: 0, lostAtGate: 0 }
+  for (const r of results) for (const k of Object.keys(released) as (keyof typeof released)[]) released[k] += r.score.released[k]
   return {
-    label, runs: results.length, probes,
+    label, runs: results.length, probes, released,
     cardsPerMin: sum(results, r => r.arrivals ?? 0) / Math.max(1, sum(results, r => r.window ?? 1)),
     requests: requests.length, accepted: sum(results, r => r.score.requests.accepted), completed: done.length,
     ackP50: quantile(acks, 0.5), ackP95: quantile(acks, 0.95), resultP50: quantile(done, 0.5), resultP95: quantile(done, 0.95),
@@ -145,13 +148,13 @@ const JUDGEMENT: [string, (row: Summary) => string][] = [
   ['tokens in(cached)/out', r => r.model ? `${(r.model.promptTokens / 1000).toFixed(0)}k(${(r.model.cachedTokens / 1000).toFixed(0)}k)/${(r.model.completionTokens / 1000).toFixed(1)}k` : '—'],
 ]
 
-async function model(name = process.env.ROUTER_MODEL ?? 'deepseek-flash'): Promise<() => Router> {
+async function model(name = process.env.ROUTER_MODEL ?? 'deepseek-flash', extra: { releasedFix?: boolean } = {}): Promise<() => Router> {
   await loadEnv()
   const apiKey = process.env.DEEPSEEK_API_KEY
   if (!apiKey) throw new Error('DEEPSEEK_API_KEY is not set (put it in .env)')
   const baseUrl = process.env.ROUTER_BASE_URL ?? 'https://api.deepseek.com'
   const verbose = args.includes('--verbose')
-  return () => modelRouter({ baseUrl, apiKey, model: name, ...verbose ? { onStep: step => console.error(
+  return () => modelRouter({ baseUrl, apiKey, model: name, ...extra, ...verbose ? { onStep: step => console.error(
     `  ${step.atSec.toFixed(0).padStart(5)}s  ${step.latencySec.toFixed(1).padStart(5)}s  +${step.jobs} job(s)  ${step.toolCalls.join(',') || '(text)'}${step.text ? `  “${step.text.replace(/\s+/g, ' ').slice(0, 80)}”` : ''}`) } : {} })
 }
 /** A small team hour: 8 requests with follow-ups (half of the cross-thread ones addressed), chatter, and addressed small talk. */
@@ -181,6 +184,25 @@ const saturating = (perMin: number): Partial<GenerateOptions> => {
  * only the batch size changes. Faster arrival (`saturating`) also repeats task texts and ends tickets early, which confounds it.
  */
 const BATCHING: Partial<GenerateOptions> = { ...HARD, durationSec: 600, requests: 12, noise: 0, addressedNoise: 6, globalProbes: 10 }
+/**
+ * Released follow-ups: short tickets with several follow-ups each, so tickets often end (ready) while a follow-up waits
+ * unread; the ticket lets it go and it comes back to Eval (`Tickets.letGo`).
+ */
+const RELEASE: Partial<GenerateOptions> = { durationSec: 900, requests: 10, noise: 0, addressedNoise: 4, followupsPerRequest: 4, crossFraction: 0.5,
+  crossAddressed: 1, ciPerRequest: 0, workSec: [120, 300], extraSec: [30, 90] }
+const RELEASED: [string, (row: Summary) => string][] = [
+  ['case', r => r.label],
+  ['released', r => String(r.released.total)],
+  ['→router', r => String(r.released.reachedRouter)],
+  ['rescued', r => String(r.released.rescued)],
+  ['lost@router', r => String(r.released.lostAtRouter)],
+  ['lost@gate', r => String(r.released.lostAtGate)],
+  ['follow fast', r => `${r.followFast}/${r.followTotal}`],
+  ['cross right/wrong/new/lost', r => `${r.cross.attachedRight}/${r.cross.attachedWrong}/${r.cross.acceptedAsNew}/${r.cross.lost} of ${r.cross.total}`],
+  ['false tickets', r => String(r.falseTickets)],
+  ['calls', r => String(r.model?.calls ?? '—')],
+  ['tokens in', r => r.model ? `${(r.model.promptTokens / 1000).toFixed(0)}k` : '—'],
+]
 const MODELS = (process.env.ROUTER_MODELS ?? 'deepseek-flash,deepseek-v4-pro').split(',').map(name => name.trim()).filter(Boolean)
 
 const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: typeof SCHEDULING; probes?: boolean }>> = {
@@ -220,6 +242,15 @@ const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: type
     const router = await model()
     return { rows: await sequence((process.env.SAT_RATES ?? '20,60,120').split(',').map(Number), perMin => pooled(`${perMin}/min`, saturating(perMin), { maxWorkers: 16 }, router)),
       columns: [...JUDGEMENT.slice(0, 1), ['arrivals/min', r => r.cardsPerMin.toFixed(0)], ...JUDGEMENT.slice(1)], probes: true }
+  },
+  /** Released follow-ups: the product as it is against the candidate fix (`released` on cards plus a dispatch rule). */
+  'model-released': async () => {
+    const SIM = { maxWorkers: 16, workerStepSec: Number(process.env.WORKER_STEP ?? 60) }
+    const rows = [await pooled('oracle', RELEASE, SIM)]
+    if (process.env.ORACLE_ONLY) return { rows, columns: RELEASED }
+    rows.push(await pooled('model', RELEASE, SIM, await model()))
+    rows.push(await pooled('model + released fix', RELEASE, SIM, await model(undefined, { releasedFix: true })))
+    return { rows, columns: RELEASED }
   },
   /** D2, controlled: the same hard mix, the Router held until `minBatch` cards wait (ROUTER_MODEL). */
   'model-batch': async () => {

@@ -19,6 +19,7 @@ Options: `--runs N` (seeds per row, default 10), `--json`, `--out file.json` (ro
 | `model-burst` | oracle vs model | Judgement on a short burst |
 | `model-hard` | oracle vs each model in `ROUTER_MODELS` | Hard cases: sibling tickets, stop, status, duplicate, similar new request, vague reference, question, hold, refusal, indirect request |
 | `model-saturation` | model | The hard mix at rising rates (nominal 20/60/120 per minute, `SAT_RATES`). Confounded at high rates: tasks repeat and short tickets end early (released inputs come back to Eval), so use `model-batch` for D2 |
+| `model-released` | oracle, model, model + fix | Follow-ups a ticket lets go unread when it ends (`Tickets.letGo`): how many the Router recovers as the product is, and with the candidate fix (`released` on cards plus a dispatch rule, `releasedFix` in `llm-router.ts`). `WORKER_STEP` sets how long a worker takes to read new input (default 60 s) |
 | `model-batch` | oracle and model per size | D2, controlled: a fixed hard mix (no repeated task, tickets open throughout) with the Router held until `minBatch` cards wait (1/5/10/20, `BATCH_SIZES`); judgement only, the hold inflates acknowledgement times |
 
 Model experiments read `DEEPSEEK_API_KEY` from the environment or `.env`; `ROUTER_BASE_URL` (default
@@ -41,7 +42,8 @@ concurrently.
 With the oracle, a run measures scheduling and routing mechanics; with a model, it also measures the Router's judgement.
 Neither measures workers' code quality. Every run is scored the same way from the records (`score` in `sim.ts`): requests
 accepted, tickets created for no request, cross-thread follow-ups attached to the right ticket, wrong one, accepted as new
-work, or lost.
+work, or lost. A message counts as reaching a ticket while it is in the ticket's fan-out or the ticket's worker acknowledged
+it: an ended ticket drops even messages its worker read from its fan-out.
 
 ## Scenario
 
