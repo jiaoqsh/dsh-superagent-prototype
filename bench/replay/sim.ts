@@ -55,11 +55,30 @@ export interface SimOptions {
    * may retry) and frees its slot; 0 is none, as in the prototype.
    */
   watchdogSec: number
+  /**
+   * Fault injection (#8): the share of first assignments whose worker runs away at a random point of its work: it goes on
+   * working, reading input and holding its slot, but never converges or reports. Its activity hides it from `watchdogSec`.
+   */
+  loopRate: number
+  /** A budget on one worker turn (wall time standing in for steps, tokens or cost): past it the turn ends as failed; 0 is none. */
+  turnBudgetSec: number
+  /**
+   * The model behind the main Session is down from `atSec` for `sec`: `stall` holds a step until it is back (the model
+   * request is retried), `fail` ends each turn that starts meanwhile without acting on what it took in. Oracle Router only.
+   */
+  routerOutage?: { atSec: number; sec: number; mode: 'stall' | 'fail' }
+  /**
+   * The host restarts at this second (0 = never): running worker turns are interrupted and the Engine decides how each goes on
+   * (`assignmentInterrupted`). A kept Session goes on from where it stopped; a lost one (`sessionLost`) does the work again.
+   */
+  restartAtSec: number
+  sessionLost: boolean
 }
 export const DEFAULT_SIM: SimOptions = {
   seed: 1, maxWorkers: 3, routerBaseSec: 1.72, routerPerItemSec: 0.78, routerErrorRate: 0, launchSec: 30, workerStepSec: 15,
   pollSec: 0, tickSec: 2, evalTimeoutSec: 120, mode: 'off', minBatch: 1, batchHoldSec: 60,
   followupNotices: false, hangRate: 0, watchdogSec: 0,
+  loopRate: 0, turnBudgetSec: 0, restartAtSec: 0, sessionLost: false,
 }
 
 /** What waits for the main Session: a candidate card, or a worker's ready report to relay. */
@@ -77,6 +96,8 @@ export interface RouterStats {
   busySec: number
   refusals: string[]
   /** Model Routers: calls, tokens, and wall-time latency per call. */
+  /** Jobs a turn took in and dropped because the model was down (`routerOutage` mode `fail`), by kind. */
+  dropped?: Partial<Record<Job['kind'], number>>
   model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencySec: number[]; toolCalls: Record<string, number>; retries?: number }
 }
 /** What a Router sees of the world: the real Engine and records, virtual time, and jobs steered in while it works. */
@@ -113,6 +134,16 @@ export const oracleRouter: Router = {
   name: 'oracle',
   async turn(jobs, world) {
     world.delivered(jobs)
+    const outage = world.options.routerOutage
+    if (outage && world.now() >= outage.atSec && world.now() < outage.atSec + outage.sec) {
+      if (outage.mode === 'stall') world.advance(outage.atSec + outage.sec - world.now())
+      else {
+        world.advance(world.options.routerBaseSec)
+        const dropped = world.stats.dropped ??= {}
+        for (const job of jobs) dropped[job.kind] = (dropped[job.kind] ?? 0) + 1
+        return
+      }
+    }
     world.advance(world.options.routerBaseSec + world.options.routerPerItemSec * jobs.length)
     const wrong = () => world.random() < world.options.routerErrorRate
     for (const job of jobs) {
@@ -164,7 +195,13 @@ export const oracleRouter: Router = {
   },
 }
 
-interface Worker { ticketId: string; assignmentId: string; remaining: number; resumedAt: number; token: number; busy: boolean; hungAt?: number }
+interface Worker {
+  ticketId: string; assignmentId: string; remaining: number; resumedAt: number; token: number; busy: boolean; hungAt?: number
+  /** When it ran away (`loopRate`), and when its current turn began (`turnBudgetSec`). */
+  loopAt?: number; turnAt: number
+  /** A restart interrupted its turn: it reads and reports nothing more. */
+  gone?: boolean
+}
 interface RequestStat { triggerId: string; task: string; arrivedAt: number; ackAt?: number; resultAt?: number }
 export interface FollowupStat { triggerId: string; kind: 'followup' | 'cross'; task: string; arrivedAt: number; addressed: boolean; ackAt?: number }
 
@@ -215,7 +252,13 @@ export interface SimResult {
    * Injected hangs: how many, after how long the Watchdog noticed each, how many nobody noticed by the end, the slot-seconds
    * they held (unnoticed ones until the run ended, so a floor), and tickets still waiting for a slot when the run ended.
    */
-  faults: { hung: number; detectedSec: number[]; unnoticed: number; slotSec: number; neverStarted: number }
+  faults: { hung: number; detectedSec: number[]; unnoticed: number; slotSec: number; neverStarted: number
+    /** Runaway workers (`loopRate`): how many, after how long the turn budget stopped each, how many ran on to the end. */
+    looped: number; loopStoppedSec: number[]; loopUnnoticed: number
+    /** Healthy turns the budget stopped (false alarms), and hung ones it stopped. */
+    healthyStopped: number; hungStopped: number
+    /** Host restart: running turns interrupted, and worker seconds done again because a lost Session started over. */
+    interrupted: number; redoSec: number }
   score: Score
   errors: string[]
   /** The run's records, for analysis; not serialized. */
@@ -243,7 +286,7 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   const stats: RouterStats = { turns: 0, steps: 0, batches: [], items: 0, busySec: 0, refusals: [] }
   const result: SimResult = {
     scenario: scenario.name, router: router.name, options: o, endSec: 0, requests: [], followups: [], routerStats: stats,
-    decisions: {}, gateRejected: 0, evals: 0, workers: { peak: 0, slotWaitSec: [] }, faults: { hung: 0, detectedSec: [], unnoticed: 0, slotSec: 0, neverStarted: 0 }, score: undefined as unknown as Score, errors: [],
+    decisions: {}, gateRejected: 0, evals: 0, workers: { peak: 0, slotWaitSec: [] }, faults: { hung: 0, detectedSec: [], unnoticed: 0, slotSec: 0, neverStarted: 0, looped: 0, loopStoppedSec: [], loopUnnoticed: 0, healthyStopped: 0, hungStopped: 0, interrupted: 0, redoSec: 0 }, score: undefined as unknown as Score, errors: [],
   }
   const requests = new Map<string, RequestStat>()
   const followups = new Map<string, FollowupStat>()
@@ -360,11 +403,13 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   const launchQueue: { ticketId: string; assignmentId: string; queuedAt: number }[] = []
   const workers = new Map<string, Worker>()
   let launching = 0
+  /** Assignments taken from the queue and starting (`launchSec`), so a request meanwhile does not queue them again. */
+  const inLaunch = new Set<string>()
   const busyCount = () => [...workers.values()].filter(worker => worker.busy).length + launching
   const executor: Executor = {
     // The Engine asks again for an assignment that waits for a slot; one launch per assignment, as the DSH executor keys it.
     start: (ticket, assignment) => later(0, () => {
-      if (launchQueue.some(item => item.assignmentId === assignment.id) || workers.get(ticket.id)?.assignmentId === assignment.id) return
+      if (launchQueue.some(item => item.assignmentId === assignment.id) || inLaunch.has(assignment.id) || workers.get(ticket.id)?.assignmentId === assignment.id) return
       launchQueue.push({ ticketId: ticket.id, assignmentId: assignment.id, queuedAt: now })
       kickLaunch()
     }),
@@ -381,22 +426,29 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
       const next = launchQueue.shift()!
       result.workers.slotWaitSec.push(now - next.queuedAt)
       launching++
+      inLaunch.add(next.assignmentId)
       later(o.launchSec, () => {
         launching--
+        inLaunch.delete(next.assignmentId)
         const ticket = repo.tickets.get(next.ticketId)
         if (!ticket || ticket.ended || ticket.assignments.at(-1)?.id !== next.assignmentId) { kickLaunch(); return }
         if (!guard(() => engine.assignmentStarted(next.ticketId, next.assignmentId))) { kickLaunch(); return }
         const first = ticket.assignments.length === 1
-        // A resumed assignment's worker first reads the Inputs that woke it, so it cannot report before taking them up.
+        // A resumed assignment's worker first reads the Inputs that woke it, so it cannot report before taking them up; one a
+        // restart interrupted still has its work left.
+        const carried = carry.get(next.ticketId)
+        carry.delete(next.ticketId)
         const worker: Worker = { ticketId: next.ticketId, assignmentId: next.assignmentId,
-          remaining: first ? workOf(ticketTask.get(next.ticketId)) : o.workerStepSec + 1,
-          resumedAt: now, token: (workers.get(next.ticketId)?.token ?? 0) + 1, busy: true }
+          remaining: first ? workOf(ticketTask.get(next.ticketId)) : (carried ?? 0) + o.workerStepSec + 1,
+          resumedAt: now, token: (workers.get(next.ticketId)?.token ?? 0) + 1, busy: true, turnAt: now }
         if (workers.get(next.ticketId)?.assignmentId === next.assignmentId) result.errors.push(`${now.toFixed(0)}s assignment ${next.assignmentId} launched twice`)
         workers.set(next.ticketId, worker)
         result.workers.peak = Math.max(result.workers.peak, busyCount())
         schedule(worker)
         deliverInputs(next.ticketId)
         if (first && o.hangRate > 0 && faultRandom() < o.hangRate) hang(worker, faultRandom() * worker.remaining)
+        if (first && o.loopRate > 0 && faultRandom() < o.loopRate) runAway(worker, faultRandom() * worker.remaining)
+        budget(worker)
       })
     }
   }
@@ -413,18 +465,70 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
       if (!o.watchdogSec) return
       later(o.watchdogSec, () => {
         if (worker.hungAt === undefined || !worker.busy) return
-        worker.busy = false
         result.faults.detectedSec.push(now - since)
         result.faults.slotSec += now - since
-        const ticket = repo.tickets.get(worker.ticketId)
-        if (ticket && !ticket.ended) {
-          const summary = `Watchdog: no activity for ${Math.round(o.watchdogSec / 60)} min; the turn was stopped.`
-          world.command(() => engine.report(worker.ticketId, { state: 'failed', summary }))
-          guard(() => engine.turnEnded(worker.ticketId, worker.assignmentId))
-        }
-        kickLaunch()
+        endTurn(worker, `Watchdog: no activity for ${Math.round(o.watchdogSec / 60)} min; the turn was stopped.`)
       })
     })
+  }
+  /** Ends a worker's turn as failed (the person is told and may retry) and frees its slot. */
+  function endTurn(worker: Worker, summary: string) {
+    worker.busy = false
+    worker.token++
+    const ticket = repo.tickets.get(worker.ticketId)
+    if (ticket && !ticket.ended) {
+      world.command(() => engine.report(worker.ticketId, { state: 'failed', summary }))
+      guard(() => engine.turnEnded(worker.ticketId, worker.assignmentId))
+    }
+    kickLaunch()
+  }
+  /** The worker runs away after `afterSec`: busy and reading input, it never converges or reports. */
+  function runAway(worker: Worker, afterSec: number) {
+    later(afterSec, () => {
+      if (!worker.busy || worker.hungAt !== undefined || worker.loopAt !== undefined) return
+      worker.loopAt = now
+      worker.token++
+      result.faults.looped++
+    })
+  }
+  /** Ends the worker's current turn once it has run `turnBudgetSec`, whatever it is doing. */
+  function budget(worker: Worker) {
+    if (!o.turnBudgetSec) return
+    const at = worker.turnAt
+    later(o.turnBudgetSec, () => {
+      if (!worker.busy || worker.turnAt !== at || workers.get(worker.ticketId) !== worker) return
+      if (worker.loopAt !== undefined) { result.faults.loopStoppedSec.push(now - worker.loopAt); result.faults.slotSec += now - worker.loopAt }
+      else if (worker.hungAt !== undefined) { result.faults.hungStopped++; result.faults.slotSec += now - worker.hungAt }
+      else result.faults.healthyStopped++
+      endTurn(worker, `The turn ran past its budget of ${Math.round(o.turnBudgetSec / 60)} min and was stopped.`)
+    })
+  }
+  /** Work left to running turns a restart interrupted, by ticket, for the assignment the Engine starts in their place. */
+  const carry = new Map<string, number>()
+  function restart() {
+    for (const worker of workers.values()) {
+      if (!worker.busy || worker.hungAt !== undefined || worker.loopAt !== undefined) continue
+      const ticket = repo.tickets.get(worker.ticketId)
+      if (!ticket || ticket.ended || runningAssignment(ticket)?.id !== worker.assignmentId) continue
+      const done = now - worker.resumedAt
+      const left = Math.max(0, worker.remaining - done)
+      worker.busy = false
+      worker.gone = true
+      worker.token++
+      result.faults.interrupted++
+      // A kept Session goes on where it stopped; a lost one starts the assignment over (an upper bound: its files remain).
+      const total = left + (o.sessionLost ? done : 0)
+      if (o.sessionLost) result.faults.redoSec += done
+      carry.set(worker.ticketId, total)
+      guard(() => engine.assignmentInterrupted(worker.ticketId, worker.assignmentId))
+      // The Engine kept the assignment (its worker had reported and read nothing since): its Session goes on with it.
+      if (runningAssignment(repo.tickets.get(worker.ticketId)!)?.id === worker.assignmentId) {
+        carry.delete(worker.ticketId)
+        Object.assign(worker, { gone: false, busy: true, remaining: total })
+        schedule(worker)
+      }
+    }
+    kickLaunch()
   }
   function schedule(worker: Worker) {
     const token = ++worker.token
@@ -448,12 +552,12 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
     const ticket = repo.tickets.get(ticketId)
     const worker = workers.get(ticketId)
     const assignment = ticket && runningAssignment(ticket)
-    if (!ticket || !worker || worker.hungAt !== undefined || !assignment || assignment.id !== worker.assignmentId || !ticket.undelivered.length) return
+    if (!ticket || !worker || worker.hungAt !== undefined || worker.gone || !assignment || assignment.id !== worker.assignmentId || !ticket.undelivered.length) return
     const inputIds = [...ticket.undelivered]
     if (!guard(() => engine.inputsDelivered(ticketId, assignment.id, inputIds))) return
     later(o.workerStepSec, () => {
-      // A worker that hung meanwhile reads nothing more.
-      if (worker.hungAt !== undefined) return
+      // A worker that hung or was interrupted meanwhile reads nothing more.
+      if (worker.hungAt !== undefined || worker.gone) return
       guard(() => engine.inputsRead(ticketId, inputIds))
       const current = repo.tickets.get(ticketId)!
       let extra = 0
@@ -468,10 +572,14 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
           if (stat && stat.ackAt === undefined) stat.ackAt = now
         }
       }
-      if (!extra) return
+      if (!extra || worker.loopAt !== undefined) return
       // Work arriving after a ready report reopens the worker's turn; otherwise it extends the current one.
       if (worker.busy) worker.remaining = Math.max(0, worker.remaining - (now - worker.resumedAt)) + extra
-      else { worker.busy = true; worker.remaining = extra; result.workers.peak = Math.max(result.workers.peak, busyCount()) }
+      else {
+        worker.busy = true; worker.remaining = extra; worker.turnAt = now
+        result.workers.peak = Math.max(result.workers.peak, busyCount())
+        budget(worker)
+      }
       schedule(worker)
     })
   }
@@ -498,6 +606,8 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
       result.decisions[event.data.kind] = (result.decisions[event.data.kind] ?? 0) + 1
       decisionIds.push(event.data.decisionId)
       const decision = repo.decisions.get(event.data.decisionId)
+      // Unavailable for want of the Router (its Evals ran out of requeues), not because a ticket took the messages meanwhile.
+      if (decision?.kind === 'unavailable' && JSON.stringify(decision.reason).includes('"timeout"')) result.decisions.timeout = (result.decisions.timeout ?? 0) + decision.triggerIds.length
       for (const id of decision?.triggerIds ?? []) if (wasLetGo(id)) released.add(id)
       // An ignore whose Eval never reached the Router is the gate's (program layer) refusal.
       if (decision?.kind === 'ignore' && !seenEvals.has(decision.evalId)) result.gateRejected += decision.triggerIds.length
@@ -549,6 +659,7 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
   const lastArrival = Math.max(...queue.map(item => item.at))
   const tick = () => { pump(); if (now < lastArrival || queue.length) later(o.tickSec, tick) }
   later(0, tick)
+  if (o.restartAtSec) later(o.restartAtSec, restart)
   function step() {
     const item = queue.shift()!
     now = Math.max(now, item.at)
@@ -561,7 +672,11 @@ export async function simulate(scenario: Scenario, options: Partial<SimOptions> 
     if (!turnDue && !routerBusy && !queue.some(next => next.run !== tick) && now > lastArrival) break
   }
   result.endSec = now
-  for (const worker of workers.values()) if (worker.hungAt !== undefined && worker.busy) { result.faults.unnoticed++; result.faults.slotSec += now - worker.hungAt }
+  for (const worker of workers.values()) {
+    if (!worker.busy) continue
+    if (worker.hungAt !== undefined) { result.faults.unnoticed++; result.faults.slotSec += now - worker.hungAt }
+    else if (worker.loopAt !== undefined) { result.faults.loopUnnoticed++; result.faults.slotSec += now - worker.loopAt }
+  }
   result.faults.neverStarted = launchQueue.length
   result.requests = [...requests.values()]
   result.followups = [...followups.values()]
