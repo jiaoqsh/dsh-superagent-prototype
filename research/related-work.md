@@ -1,4 +1,4 @@
-# Super-agent 业内对照
+# Super-agent 相关工作与业内实践
 
 整理日期：2026-11-04。对象：《Super-agent 设计探索：迈向更自主的 Agent 系统》和 `dsh-superagent-prototype`，与之后（及同期）业内已经发布的产品和实践对照。
 
