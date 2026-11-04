@@ -42,7 +42,7 @@ print(f'turns {len(turns)}, agent-hours {hours:.1f}, steps {len(gaps)}')
 print('gap (s): ' + '  '.join(f'p{p * 100:g}={q(gaps, p):.0f}' for p in (0.5, 0.9, 0.99, 0.999)) + f'  max={gaps[-1]:.0f}')
 print('\n| threshold | turns longer (a turn-time limit) | turns with a gap longer (an activity limit) | false alarms / agent-hour |')
 print('|---|---|---|---|')
-for minutes in (1, 2, 5, 10, 15, 20, 30, 60):
+for minutes in (1, 2, 5, 10, 15, 20, 30, 60, 120, 180):
     t = minutes * 60
     longer = sum(1 for length in lengths if length > t)
     gapped = sum(1 for turn in turns if any(b - a > t for a, b in zip(turn, turn[1:])))

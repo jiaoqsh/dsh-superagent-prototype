@@ -4,7 +4,7 @@
  *   node --experimental-transform-types --no-warnings bench/replay/run.ts <experiment> [--json] [--runs N] [--out file.json]
  *
  * Oracle experiments (deterministic, free): baseline, sweep-rate, sweep-router, sweep-workers, sweep-errors, sweep-poll, sweep-cross,
- * fault-hang.
+ * fault-hang, fault-loop, fault-router, fault-restart.
  * Model experiments (call the API in DEEPSEEK_API_KEY, model ROUTER_MODEL or deepseek-flash): model-small, model-burst,
  * model-hard (oracle and every model in ROUTER_MODELS, default deepseek-flash,deepseek-v4-pro), model-saturation, model-batch,
  * model-released, model-prompt, model-stop.
@@ -35,7 +35,7 @@ export interface Summary {
   cross: SimResult['score']['cross']
   noiseAtRouter: number; noiseAccepted: number; falseTickets: number
   routerTurns: number; routerSteps: number; meanBatch: number; maxBatch: number; routerBusy: number; perItemSec: number
-  evals: number; gateRejected: number; unavailable: number; refusals: number
+  evals: number; gateRejected: number; unavailable: number; timedOut: number; refusals: number
   peakWorkers: number; slotWaitP95: number
   /** Hard cases by kind, pooled over runs. */
   probes: Record<string, { total: number; reachedRouter: number; right: number; outcomes: Record<string, number> }>
@@ -47,7 +47,11 @@ export interface Summary {
   harm: number
   probeSeeds: number[]
   /** Injected hangs, pooled (`SimResult.faults`). */
-  faults: { hung: number; noticed: number; unnoticed: number; noticeP50: number; slotHours: number; neverStarted: number; stalledRuns: number }
+  faults: { hung: number; noticed: number; unnoticed: number; noticeP50: number; slotHours: number; neverStarted: number; stalledRuns: number
+    looped: number; loopStopped: number; loopStoppedP50: number; loopUnnoticed: number; healthyStopped: number; hungStopped: number
+    interrupted: number; redoHours: number; dropped: Record<string, number> }
+  /** Follow-ups (same thread and cross-thread) a worker acknowledged. */
+  followAcked: number
   model?: { calls: number; promptTokens: number; cachedTokens: number; completionTokens: number; latencyP50: number; latencyP95: number; toolCalls: Record<string, number>; retries: number; slowCalls: number }
   errors: string[]
 }
@@ -76,7 +80,13 @@ export function summarize(label: string, results: (SimResult & { window?: number
     harm: sum(results, r => r.score.harm),
     faults: { hung: sum(results, r => r.faults.hung), noticed: sum(results, r => r.faults.detectedSec.length), unnoticed: sum(results, r => r.faults.unnoticed),
       noticeP50: quantile(results.flatMap(r => r.faults.detectedSec), 0.5), slotHours: sum(results, r => r.faults.slotSec) / 3600,
-      neverStarted: sum(results, r => r.faults.neverStarted), stalledRuns: results.filter(r => r.faults.neverStarted > 0).length },
+      neverStarted: sum(results, r => r.faults.neverStarted), stalledRuns: results.filter(r => r.faults.neverStarted > 0).length,
+      looped: sum(results, r => r.faults.looped), loopStopped: sum(results, r => r.faults.loopStoppedSec.length),
+      loopStoppedP50: quantile(results.flatMap(r => r.faults.loopStoppedSec), 0.5), loopUnnoticed: sum(results, r => r.faults.loopUnnoticed),
+      healthyStopped: sum(results, r => r.faults.healthyStopped), hungStopped: sum(results, r => r.faults.hungStopped),
+      interrupted: sum(results, r => r.faults.interrupted), redoHours: sum(results, r => r.faults.redoSec) / 3600,
+      dropped: stats.reduce<Record<string, number>>((a, st) => { for (const [k, v] of Object.entries(st.dropped ?? {})) a[k] = (a[k] ?? 0) + v; return a }, {}) },
+    followAcked: sum(results, r => r.followups.filter(f => f.ackAt !== undefined).length),
     probeSeeds: results.map(r => Object.values(r.score.probes).reduce((n, t) => n + t.right, 0)),
     cardsPerMin: sum(results, r => r.arrivals ?? 0) / Math.max(1, sum(results, r => r.window ?? 1)),
     requests: requests.length, accepted: sum(results, r => r.score.requests.accepted), completed: done.length,
@@ -88,7 +98,7 @@ export function summarize(label: string, results: (SimResult & { window?: number
     meanBatch: mean(stats.flatMap(st => st.batches.filter(n => n > 0))), maxBatch: Math.max(0, ...stats.flatMap(st => st.batches)),
     routerBusy: sum(stats, st => st.busySec) / Math.max(1, sum(results, r => r.endSec)),
     perItemSec: sum(stats, st => st.busySec) / Math.max(1, sum(stats, st => st.items)),
-    evals: sum(results, r => r.evals), gateRejected: sum(results, r => r.gateRejected), unavailable: sum(results, r => r.decisions.unavailable ?? 0),
+    evals: sum(results, r => r.evals), gateRejected: sum(results, r => r.gateRejected), unavailable: sum(results, r => r.decisions.unavailable ?? 0), timedOut: sum(results, r => r.decisions.timeout ?? 0),
     refusals: sum(stats, st => st.refusals.length),
     peakWorkers: Math.max(...results.map(r => r.workers.peak)), slotWaitP95: quantile(results.flatMap(r => r.workers.slotWaitSec), 0.95),
     ...models.length ? { model: {
@@ -163,6 +173,43 @@ const FAULTS: [string, (row: Summary) => string][] = [
   ['never noticed', r => String(r.faults.unnoticed)],
   ['slot-hours held', r => `${r.faults.unnoticed ? '≥' : ''}${r.faults.slotHours.toFixed(1)}`],
   ['never started (runs)', r => `${r.faults.neverStarted} (${r.faults.stalledRuns})`],
+]
+/** Runaway workers (#8): what the activity Watchdog misses, and what a turn budget catches at what cost. */
+const LOOPS: [string, (row: Summary) => string][] = [
+  ['case', r => r.label],
+  ['done', r => `${r.completed}/${r.requests}`],
+  ['result p95', r => min(r.resultP95)],
+  ['slot wait p95', r => min(r.slotWaitP95)],
+  ['ran away', r => String(r.faults.looped)],
+  ['stopped (p50 after)', r => r.faults.loopStopped ? `${r.faults.loopStopped} (${min(r.faults.loopStoppedP50)})` : '0'],
+  ['ran to the end', r => String(r.faults.loopUnnoticed)],
+  ['healthy turns stopped', r => String(r.faults.healthyStopped)],
+  ['slot-hours held', r => `${r.faults.loopUnnoticed ? '≥' : ''}${r.faults.slotHours.toFixed(1)}`],
+  ['never started (runs)', r => `${r.faults.neverStarted} (${r.faults.stalledRuns})`],
+]
+/** The main Session's model down for a while (#8): what is lost, delayed, or never relayed. */
+const OUTAGE: [string, (row: Summary) => string][] = [
+  ['case', r => r.label],
+  ['accepted', r => `${r.accepted}/${r.requests}`],
+  ['timed out (msgs)', r => String(r.timedOut)],
+  ['results relayed', r => `${r.completed}/${r.accepted}`],
+  ['ack p50/p95', r => `${s(r.ackP50)}/${s(r.ackP95)}`],
+  ['result p95', r => min(r.resultP95)],
+  ['cross right/lost', r => `${r.cross.attachedRight}/${r.cross.lost} of ${r.cross.total}`],
+  ['evals', r => String(r.evals)],
+  ['dropped cand/relay/notice', r => `${r.faults.dropped.candidate ?? 0}/${r.faults.dropped.relay ?? 0}/${r.faults.dropped.followup ?? 0}`],
+]
+/** A host restart with workers running (#8): whether anything is lost, and the work done again. */
+const RESTART: [string, (row: Summary) => string][] = [
+  ['case', r => r.label],
+  ['done', r => `${r.completed}/${r.requests}`],
+  ['result p50/p95', r => `${min(r.resultP50)}/${min(r.resultP95)}`],
+  ['interrupted', r => String(r.faults.interrupted)],
+  ['worker-hours redone', r => r.faults.redoHours.toFixed(1)],
+  ['follow fast', r => `${r.followFast}/${r.followTotal}`],
+  ['follow-ups acked', r => String(r.followAcked)],
+  ['cross right/lost', r => `${r.cross.attachedRight}/${r.cross.lost} of ${r.cross.total}`],
+  ['errors', r => String(r.errors.length)],
 ]
 const JUDGEMENT: [string, (row: Summary) => string][] = [
   ['case', r => r.label],
@@ -282,6 +329,36 @@ const experiments: Record<string, () => Promise<{ rows: Summary[]; columns: type
       rows.push(await pooled(`hang ${rate * 100}%, watchdog ${minutes} min`, {}, { hangRate: rate, watchdogSec: minutes * 60 }))
     }
     return { rows, columns: FAULTS }
+  },
+  /**
+   * Runaway workers (#8): LOOP_RATE (default 0.15) of first assignments run away mid-work: busy, reading input, never reporting.
+   * With the activity Watchdog alone (20 min) and with a turn budget of each of BUDGET_MIN (default 120,60 minutes).
+   */
+  'fault-loop': async () => {
+    const rate = Number(process.env.LOOP_RATE ?? 0.15)
+    const rows = [await pooled('no faults', {}, {}), await pooled(`runaway ${rate * 100}%, nothing`, {}, { loopRate: rate }),
+      await pooled(`runaway ${rate * 100}%, activity watchdog 20 min`, {}, { loopRate: rate, watchdogSec: 1200 })]
+    for (const minutes of (process.env.BUDGET_MIN ?? '120,60').split(',').map(Number)) {
+      rows.push(await pooled(`runaway ${rate * 100}%, watchdog 20 + budget ${minutes} min`, {}, { loopRate: rate, watchdogSec: 1200, turnBudgetSec: minutes * 60 }))
+    }
+    return { rows, columns: LOOPS }
+  },
+  /**
+   * The main Session's model down (#8) from minute 20 of the baseline hour for each of OUTAGE_MIN (default 5,15,30,60) minutes,
+   * with its requests retried until it is back (stall) and failing fast (fail).
+   */
+  'fault-router': async () => {
+    const rows = [await pooled('no outage', {}, {})]
+    for (const mode of ['stall', 'fail'] as const) for (const minutes of (process.env.OUTAGE_MIN ?? '5,15,30,60').split(',').map(Number)) {
+      rows.push(await pooled(`${mode} ${minutes} min`, {}, { routerOutage: { atSec: 1200, sec: minutes * 60, mode } }))
+    }
+    return { rows, columns: OUTAGE }
+  },
+  /** A host restart (#8) at minute RESTART_MIN (default 30) of the baseline hour, its workers' Sessions kept or lost. */
+  'fault-restart': async () => {
+    const at = Number(process.env.RESTART_MIN ?? 30) * 60
+    return { rows: [await pooled('no restart', {}, {}), await pooled('restart, Sessions kept', {}, { restartAtSec: at }),
+      await pooled('restart, Sessions lost', {}, { restartAtSec: at, sessionLost: true })], columns: RESTART }
   },
   'sweep-rate': async () => ({ rows: await sequence([3600, 1200, 600, 300, 120], duration =>
     pooled(`window ${duration / 60}m`, { durationSec: duration, workSec: [60, 180], extraSec: [30, 90] }, {})), columns: SCHEDULING }),
